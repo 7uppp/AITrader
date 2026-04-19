@@ -1,0 +1,14 @@
+# Local secrets (never commit)
+config.toml
+config.local.toml
+.env
+.env.*
+
+# Runtime data
+data/
+
+# Python artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
