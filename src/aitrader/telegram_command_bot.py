@@ -24,6 +24,7 @@ class TelegramCommandBot:
     runtime: TradingRuntime
     notifier: TelegramNotifier
     offset_path: Path
+    menu_sync_attempted: bool = False
 
     @classmethod
     def from_runtime(cls, runtime: TradingRuntime) -> "TelegramCommandBot":
@@ -32,6 +33,7 @@ class TelegramCommandBot:
         return cls(runtime=runtime, notifier=runtime.notifier, offset_path=offset_path)
 
     def run_once(self, timeout_seconds: int = 25) -> str:
+        self.ensure_menu_commands()
         offset = self._load_offset()
         updates, reason = self.notifier.get_updates(offset=offset, timeout_seconds=timeout_seconds)
         if reason != "ok":
@@ -98,10 +100,22 @@ class TelegramCommandBot:
             self._handle_result_command(normalized)
             return
 
+        if lower.startswith("/alive") or lower.startswith("/ping"):
+            msg = (
+                "bot alive\n"
+                f"时间: {utc_now().isoformat(timespec='seconds')} UTC\n"
+                f"系统模式: {self.runtime.mode.value}\n"
+                f"白名单: {', '.join(self.runtime.config.trading.symbols)}"
+            )
+            ok, reason = self.notifier.send_text(msg)
+            self.runtime.storage.insert_system_event(utc_now(), "telegram_alive_command", {"sent": ok, "reason": reason})
+            return
+
         if lower.startswith("/status"):
             msg = (
                 f"系统模式: {self.runtime.mode.value}\n"
                 f"分析白名单: {', '.join(self.runtime.config.trading.symbols)}\n"
+                "存活检查: /alive\n"
                 "建议回报(推荐): /result <AdviceID> win 1.2\n"
                 "快速回报: /win BTCUSDT 0.8 或 /loss ETHUSDT -0.6"
             )
@@ -116,10 +130,11 @@ class TelegramCommandBot:
                 "/scan BTCUSDT 1h -> 指定币和周期\n"
                 "btc15m / eth1h / bnb15m / dot1h / solauto -> 短命令\n"
                 "/scan BTCUSDT 500 -> 输入总预算USDT，回传主副仓数量\n"
+                "/alive -> 检查机器人是否存活\n"
+                "/status -> 查看系统状态\n"
                 "/result <AdviceID> win 1.2 -> 按建议ID回报(推荐)\n"
                 "/win SOLUSDT 0.8 -> 仅按币种快速记录盈利\n"
-                "/loss ETHUSDT -0.6 -> 仅按币种快速记录亏损\n"
-                "/status -> 查看系统状态"
+                "/loss ETHUSDT -0.6 -> 仅按币种快速记录亏损"
             )
             ok, reason = self.notifier.send_text(help_text)
             self.runtime.storage.insert_system_event(utc_now(), "telegram_help_command", {"sent": ok, "reason": reason})
@@ -127,6 +142,31 @@ class TelegramCommandBot:
 
         ok, reason = self.notifier.send_text("未识别命令。用 /help 查看可用指令。")
         self.runtime.storage.insert_system_event(utc_now(), "telegram_unknown_command", {"text": text, "sent": ok, "reason": reason})
+
+    def ensure_menu_commands(self) -> tuple[bool, str]:
+        if self.menu_sync_attempted:
+            return (True, "already_attempted")
+        self.menu_sync_attempted = True
+        commands = self._menu_commands()
+        ok, reason = self.notifier.set_my_commands(commands)
+        self.runtime.storage.insert_system_event(
+            utc_now(),
+            "telegram_menu_sync",
+            {"sent": ok, "reason": reason, "commands": [c["command"] for c in commands]},
+        )
+        return (ok, reason)
+
+    @staticmethod
+    def _menu_commands() -> list[dict[str, str]]:
+        return [
+            {"command": "scan", "description": "Scan symbols and show setup"},
+            {"command": "alive", "description": "Check bot is alive"},
+            {"command": "status", "description": "Show system status"},
+            {"command": "help", "description": "Show command help"},
+            {"command": "result", "description": "Report advice result by ID"},
+            {"command": "win", "description": "Quick win report by symbol"},
+            {"command": "loss", "description": "Quick loss report by symbol"},
+        ]
 
     def _looks_like_compact_scan(self, lower_text: str) -> bool:
         tokens = [t for t in lower_text.replace("，", " ").replace(",", " ").split(" ") if t]

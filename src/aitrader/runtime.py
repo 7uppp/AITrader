@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import httpx
+
 from .advisory import advisory_to_telegram_text, build_trade_advisory
 from .audit import config_hash
 from .binance_market_data import BinanceMarketDataClient
@@ -175,7 +177,60 @@ class TradingRuntime:
         timeframe_mode: TimeframeMode | str = "auto",
         manual_total_usdt: float | None = None,
     ) -> SymbolAnalysis:
-        snapshot = self.data_client.fetch_snapshot(symbol)
+        try:
+            snapshot = self.data_client.fetch_snapshot(symbol)
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 0
+            if status_code == 451:
+                message = (
+                    f"[不适合] {symbol}\n"
+                    "原因: Binance API 返回451，当前VPS出口IP所在地区或机房被限制。\n"
+                    "处理: 更换到允许的VPS区域，或改用合规的数据源后再运行。"
+                )
+                self.storage.insert_system_event(
+                    utc_now(),
+                    "binance_region_restricted",
+                    {"symbol": symbol, "status_code": status_code, "url": str(exc.request.url) if exc.request else None},
+                )
+                if push_to_telegram:
+                    ok, reason = self.notifier.send_text(message)
+                    self.storage.insert_system_event(
+                        utc_now(),
+                        "telegram_region_restricted_notice",
+                        {"symbol": symbol, "sent": ok, "reason": reason},
+                    )
+                return SymbolAnalysis(
+                    symbol=symbol,
+                    suitable=False,
+                    message=message,
+                    reasons=["market_region_restricted"],
+                    timeframe_mode=timeframe_mode if isinstance(timeframe_mode, str) else "auto",
+                )
+            raise
+        except httpx.RequestError as exc:
+            message = (
+                f"[不适合] {symbol}\n"
+                f"原因: 行情请求失败({type(exc).__name__})，请检查网络或VPS出口。"
+            )
+            self.storage.insert_system_event(
+                utc_now(),
+                "binance_request_error",
+                {"symbol": symbol, "error": type(exc).__name__, "message": str(exc)},
+            )
+            if push_to_telegram:
+                ok, reason = self.notifier.send_text(message)
+                self.storage.insert_system_event(
+                    utc_now(),
+                    "telegram_request_error_notice",
+                    {"symbol": symbol, "sent": ok, "reason": reason},
+                )
+            return SymbolAnalysis(
+                symbol=symbol,
+                suitable=False,
+                message=message,
+                reasons=["market_request_error"],
+                timeframe_mode=timeframe_mode if isinstance(timeframe_mode, str) else "auto",
+            )
         valid, reasons = self.market_validator.validate(snapshot, now=utc_now())
         if not valid:
             snapshot.is_stale = "stale_snapshot" in reasons
@@ -194,7 +249,7 @@ class TradingRuntime:
                 "主副仓规则: 主仓60%先止盈(+1R)，副仓40%趋势跟随。"
             )
             sent = False
-            if push_to_telegram:
+            if push_to_telegram and self.config.telegram.send_rejections:
                 ok, reason = self.notifier.send_text(message)
                 sent = ok
                 self.storage.insert_system_event(utc_now(), "telegram_unsuitable_notice", {"symbol": symbol, "sent": ok, "reason": reason})

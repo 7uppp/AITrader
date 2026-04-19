@@ -25,6 +25,12 @@ class TelegramNotifier:
         }
         return self._post("sendMessage", payload)
 
+    def set_my_commands(self, commands: list[dict[str, str]]) -> tuple[bool, str]:
+        if not self.enabled():
+            return (False, "telegram_disabled_or_missing_credentials")
+        payload = {"commands": commands}
+        return self._post("setMyCommands", payload)
+
     def get_updates(self, offset: int | None = None, timeout_seconds: int = 20) -> tuple[list[dict[str, object]], str]:
         if not self.enabled():
             return ([], "telegram_disabled_or_missing_credentials")

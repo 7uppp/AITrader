@@ -73,7 +73,9 @@ python -m aitrader serve --config config.example.toml --scan-seconds 60 --poll-t
 - Current runtime is advisory-only: it does not place exchange orders.
 - Before enabling notifications, fill `[telegram]` bot token/chat id in your own config file, or inject via env vars.
 - Command-driven mode: the bot can stay idle and only analyze when it receives Telegram `/scan` commands.
+- In auto-push mode, only suitable advisories are sent by default; `/scan` can still show unsuitable results on demand.
 - Short Telegram commands supported: `btc15m`, `eth1h`, `bnb15m`, `dot1h`, `solauto`.
+- Bot menu includes `/scan`, `/alive`, `/status`, `/help`, `/result`, `/win`, `/loss`.
 - Budget input supported for split sizing display: `/scan BTCUSDT 500` or `btc15m 500`.
 - Manual close outcome logging supported: `/result <AdviceID> win 1.2` (recommended), `/win SOLUSDT 0.8`, `/loss ETHUSDT -0.6`.
 - Advisory message includes confidence-based leverage suggestion (never above hard limit and 5x).

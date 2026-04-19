@@ -3,10 +3,27 @@ from types import SimpleNamespace
 
 from aitrader.config import TelegramConfig
 from aitrader.telegram_command_bot import TelegramCommandBot
-from aitrader.telegram_notify import TelegramNotifier
 
 
 def _bot(tmp_path: Path) -> TelegramCommandBot:
+    class _NotifierStub:
+        config = TelegramConfig(enabled=False, bot_token="", chat_id="", send_rejections=False)
+
+        def __init__(self) -> None:
+            self.sent_texts: list[str] = []
+            self.commands: list[dict[str, str]] = []
+
+        def send_text(self, text: str) -> tuple[bool, str]:
+            self.sent_texts.append(text)
+            return (True, "ok")
+
+        def set_my_commands(self, commands):
+            self.commands = list(commands)
+            return (True, "ok")
+
+        def get_updates(self, offset=None, timeout_seconds=20):
+            return ([], "ok")
+
     storage_stub = SimpleNamespace(
         insert_system_event=lambda *args, **kwargs: None,
         insert_trade_feedback=lambda *args, **kwargs: None,
@@ -20,7 +37,7 @@ def _bot(tmp_path: Path) -> TelegramCommandBot:
         config=SimpleNamespace(
             trading=SimpleNamespace(symbols=["BTCUSDT", "ETHUSDT"]),
         ),
-        notifier=TelegramNotifier(TelegramConfig(enabled=False, bot_token="", chat_id="", send_rejections=False)),
+        notifier=_NotifierStub(),
         storage=storage_stub,
         analyze_symbols=lambda symbols, push_to_telegram=False, timeframe_mode="auto", manual_total_usdt=None: [],
         mode=SimpleNamespace(value="RUNNING"),
@@ -105,3 +122,14 @@ def test_parse_result_command_with_advice_id():
     parsed, error = TelegramCommandBot._parse_result_command(bot, "/result A-BTC-1H-20260420153012-ABC123 win 1.2")
     assert error is None
     assert parsed == ("A-BTC-1H-20260420153012-ABC123", None, "WIN", 1.2, "")
+
+
+def test_menu_commands_and_alive_command(tmp_path: Path):
+    bot = _bot(tmp_path)
+    ok, reason = bot.ensure_menu_commands()
+    assert ok
+    assert reason == "ok"
+    assert [item["command"] for item in bot.notifier.commands] == ["scan", "alive", "status", "help", "result", "win", "loss"]
+
+    bot._handle_text_command("/alive")
+    assert any("bot alive" in text for text in bot.notifier.sent_texts)
