@@ -5,7 +5,7 @@ Conservative, risk-first Binance USDT-margined USDⓈ-M signal advisory bot skel
 ## What is implemented in this baseline
 
 - Modular architecture: market data, signal, risk, advisory runtime, telegram control.
-- Conservative strategy skeleton: trend + pullback + breakout, split-position (main + runner), fixed + trailing exits.
+- Normal-trading strategy skeleton: 1H trend/setup + 15m trigger, EMA + RSI + Bollinger + volume, split-position (main + runner), fixed + trailing exits.
 - Hard risk checks: daily/weekly loss caps, max drawdown stop, open risk limits, liquidation buffer guardrail.
 - Kill-switch oriented control model with `RUNNING / PAUSED / RISK_OFF / KILLED`.
 - Persistence bootstrap schema for snapshots, signals, decisions, and operator events.
@@ -74,6 +74,7 @@ python -m aitrader serve --config config.example.toml --scan-seconds 60 --poll-t
 - Before enabling notifications, fill `[telegram]` bot token/chat id in your own config file, or inject via env vars.
 - Command-driven mode: the bot can stay idle and only analyze when it receives Telegram `/scan` commands.
 - In auto-push mode, only suitable advisories are sent by default; `/scan` can still show unsuitable results on demand.
+- Default strategy mode is `1h_primary`: 1H-led direction/setup with 15m trigger and a shorter 10-minute advisory cooldown.
 - Short Telegram commands supported: `btc15m`, `eth1h`, `bnb15m`, `dot1h`, `solauto`.
 - Bot menu includes `/scan`, `/alive`, `/status`, `/help`, `/result`, `/win`, `/loss`.
 - Budget input supported for split sizing display: `/scan BTCUSDT 500` or `btc15m 500`.

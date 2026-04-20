@@ -21,14 +21,29 @@ from .types import AccountState, MarketSnapshot, SignalIntent, SystemMode
 SIGNAL_REASON_MAP: dict[str, str] = {
     "market_stale": "行情数据过期",
     "insufficient_history": "K线历史长度不足",
-    "atr_percentile_out_of_range": "波动率分位不在30%-75%区间",
-    "trend_not_confirmed": "4H趋势未确认",
+    "trend_not_confirmed": "1H趋势未确认",
     "long_disabled": "当前配置禁用做多",
     "short_disabled": "当前配置禁用做空",
-    "pullback_not_confirmed": "1H回踩结构未确认",
-    "breakout_or_volume_not_confirmed": "15m突破或量能条件未确认",
+    "setup_not_confirmed": "1H回踩结构未就绪",
+    "trigger_not_confirmed": "15m触发条件未就绪",
+    "rsi_out_of_range": "RSI不在可交易区间",
+    "confidence_below_threshold": "综合置信度不足",
     "atr_invalid": "ATR计算无效",
     "risk_distance_invalid": "止损距离无效",
+    "trend:1h_long": "1H趋势做多",
+    "trend:1h_short": "1H趋势做空",
+    "setup:pullback": "回踩成立",
+    "trigger:bb_mid_reclaim": "布林中轨收复",
+    "trigger:bb_mid_reject": "布林中轨压回",
+    "trigger:structure_breakout": "结构突破",
+    "trigger:structure_breakdown": "结构跌破",
+    "confirm:rsi_ok": "RSI确认通过",
+    "confirm:bb_ok": "布林位置确认通过",
+    "confirm:volume_ok": "量能确认通过",
+    "confirm:4h_bias_aligned": "4H顺风同向",
+    "confirm:volatility_low": "波动偏低，信号降权",
+    "confirm:volatility_high": "波动偏高，信号降权",
+    "confirm:risk_extreme": "资金费率/OI过热，信号降权",
 }
 
 RISK_REASON_MAP: dict[str, str] = {
@@ -74,7 +89,7 @@ class SymbolAnalysis:
     suitable: bool
     message: str
     reasons: list[str]
-    timeframe_mode: str = "hybrid"
+    timeframe_mode: str = "1h_primary"
 
 
 @dataclass(slots=True)
@@ -192,7 +207,7 @@ class TradingRuntime:
                     "binance_region_restricted",
                     {"symbol": symbol, "status_code": status_code, "url": str(exc.request.url) if exc.request else None},
                 )
-                if push_to_telegram:
+                if push_to_telegram and self.config.telegram.send_rejections:
                     ok, reason = self.notifier.send_text(message)
                     self.storage.insert_system_event(
                         utc_now(),
@@ -217,7 +232,7 @@ class TradingRuntime:
                 "binance_request_error",
                 {"symbol": symbol, "error": type(exc).__name__, "message": str(exc)},
             )
-            if push_to_telegram:
+            if push_to_telegram and self.config.telegram.send_rejections:
                 ok, reason = self.notifier.send_text(message)
                 self.storage.insert_system_event(
                     utc_now(),
@@ -355,12 +370,17 @@ class TradingRuntime:
         snapshot: MarketSnapshot,
         timeframe_mode: TimeframeMode | str,
     ) -> tuple[str, SignalIntent | None, list[str]]:
-        if timeframe_mode in {"15m", "1h", "hybrid"}:
+        if timeframe_mode in {"15m", "1h", "hybrid", "1h_primary"}:
             out = self.signal_engine.evaluate_explain(snapshot, timeframe_mode=timeframe_mode)
-            return (timeframe_mode, out.signal, out.failed_reasons)
+            resolved_mode = "1h_primary" if timeframe_mode in {"1h", "hybrid"} else str(timeframe_mode)
+            if out.signal is not None:
+                for code in out.signal.reason_codes:
+                    if code.startswith("timeframe:"):
+                        resolved_mode = code.split(":", maxsplit=1)[1]
+                        break
+            return (resolved_mode, out.signal, out.failed_reasons)
 
-        # auto mode: conservative-first fallback chain.
-        mode_chain: list[TimeframeMode] = ["1h", "hybrid", "15m"]
+        mode_chain: list[TimeframeMode] = ["1h_primary", "15m"]
         failed: list[str] = []
         for mode in mode_chain:
             out = self.signal_engine.evaluate_explain(snapshot, timeframe_mode=mode)
@@ -372,7 +392,7 @@ class TradingRuntime:
     @staticmethod
     def _format_signal_reasons(codes: list[str]) -> str:
         if not codes:
-            return "当前未同时满足趋势+回踩+突破+量能条件"
+            return "当前未同时满足趋势、回踩与15m触发条件"
         translated = [SIGNAL_REASON_MAP.get(code, code) for code in codes]
         return "；".join(translated)
 

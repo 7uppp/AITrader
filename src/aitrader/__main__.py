@@ -15,7 +15,7 @@ def main() -> None:
     parser.add_argument("command", nargs="?", default="demo", choices=["demo", "cycle", "scan", "tg-once", "tg-loop", "serve"])
     parser.add_argument("--config", default="config.example.toml")
     parser.add_argument("--symbols", default="")
-    parser.add_argument("--tf", default="auto", choices=["15m", "1h", "hybrid", "auto"])
+    parser.add_argument("--tf", default="auto", choices=["15m", "1h", "hybrid", "1h_primary", "auto"])
     parser.add_argument("--budget", type=float, default=0.0, help="Total USDT budget for split sizing in advisory output.")
     parser.add_argument("--poll-timeout", type=int, default=25, help="Telegram long-poll timeout seconds.")
     parser.add_argument("--sleep-seconds", type=float, default=0.0, help="Optional pause between poll cycles.")

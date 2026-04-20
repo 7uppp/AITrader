@@ -34,6 +34,22 @@ class StrategyConfig:
     runner_trailing_atr_mult: float
     runner_trailing_atr_mult_tight: float
     risk_extreme_mode_tighten_trailing: bool
+    primary_timeframe_mode: str = "1h_primary"
+    use_4h_trend_bias: bool = True
+    ema_fast_period: int = 20
+    ema_mid_period: int = 50
+    ema_slow_period: int = 200
+    rsi_period: int = 14
+    rsi_long_min: float = 45.0
+    rsi_long_max: float = 68.0
+    rsi_short_min: float = 32.0
+    rsi_short_max: float = 55.0
+    bb_period: int = 20
+    bb_stddev: float = 2.0
+    trigger_breakout_lookback_15m: int = 6
+    trigger_volume_sma_period: int = 20
+    trigger_volume_multiplier: float = 1.0
+    signal_min_confidence: float = 0.58
 
 
 @dataclass(slots=True)
@@ -72,7 +88,7 @@ class RuntimeConfig:
     loop_interval_seconds: int
     advisory_only: bool
     telegram_offset_path: str
-    advisory_cooldown_minutes: int = 45
+    advisory_cooldown_minutes: int = 10
 
 
 @dataclass(slots=True)
@@ -120,7 +136,7 @@ class AppConfig:
                 "loop_interval_seconds": 15,
                 "advisory_only": True,
                 "telegram_offset_path": "data/telegram_offset.txt",
-                "advisory_cooldown_minutes": 45,
+                "advisory_cooldown_minutes": 10,
             },
         )
         runtime = RuntimeConfig(**runtime_data)

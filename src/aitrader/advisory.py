@@ -13,6 +13,7 @@ class TradeAdvisory:
     advice_id: str
     symbol: str
     side: Side
+    trigger_source: str
     entry_trigger: float
     entry_zone_low: float
     entry_zone_high: float
@@ -69,11 +70,13 @@ def build_trade_advisory(
         else cfg.strategy.runner_trailing_atr_mult
     )
     timeframe_mode = "hybrid"
+    trigger_source = "待触发"
     for code in signal.reason_codes:
         if code.startswith("timeframe:"):
             timeframe_mode = code.split(":", maxsplit=1)[1]
-            break
-    valid_minutes = 90 if timeframe_mode == "1h" else (20 if timeframe_mode == "15m" else 45)
+        if code.startswith("trigger:"):
+            trigger_source = code.split(":", maxsplit=1)[1]
+    valid_minutes = 90 if timeframe_mode in {"1h", "1h_primary"} else (20 if timeframe_mode == "15m" else 45)
     main_usdt = None
     runner_usdt = None
     main_qty_by_usdt = None
@@ -94,6 +97,7 @@ def build_trade_advisory(
         advice_id=resolved_advice_id,
         symbol=signal.symbol,
         side=signal.side,
+        trigger_source=trigger_source,
         entry_trigger=signal.entry_price,
         entry_zone_low=signal.entry_price - zone_half,
         entry_zone_high=signal.entry_price + zone_half,
@@ -122,6 +126,8 @@ def build_trade_advisory(
 
 def advisory_to_telegram_text(ad: TradeAdvisory, snapshot: MarketSnapshot) -> str:
     side_cn = "做多" if ad.side == Side.LONG else "做空"
+    timeframe_label = _human_timeframe(ad.timeframe_mode)
+    trigger_label = _human_trigger(ad.trigger_source)
     extra_manual = ""
     if ad.manual_total_usdt is not None and ad.manual_total_usdt > 0:
         extra_manual = (
@@ -133,7 +139,8 @@ def advisory_to_telegram_text(ad: TradeAdvisory, snapshot: MarketSnapshot) -> st
     return (
         f"[交易建议] {ad.symbol} {side_cn}\n"
         f"AdviceID: {ad.advice_id}\n"
-        f"判定框架: {ad.timeframe_mode}\n"
+        f"判定框架: {timeframe_label}\n"
+        f"触发类型: {trigger_label}\n"
         f"建议有效期: 约{ad.valid_minutes}分钟\n"
         f"触发开仓价: {ad.entry_trigger:.4f}\n"
         f"建议开仓区间: {ad.entry_zone_low:.4f} - {ad.entry_zone_high:.4f}\n"
@@ -165,10 +172,28 @@ def _recommended_leverage(confidence: float, timeframe_mode: str, risk_extreme: 
 
     if timeframe_mode == "15m":
         lev = max(1.0, lev - 0.5)
-    if timeframe_mode == "hybrid":
+    if timeframe_mode in {"hybrid", "1h", "1h_primary"}:
         lev = min(2.0, lev + 0.0)
 
     cap = max(1.0, hard_limit)
     lev = min(lev, cap)
     reason = f"基于置信度/周期，且不超过硬上限{cap:.1f}x"
     return (round(lev, 1), reason)
+
+
+def _human_timeframe(timeframe_mode: str) -> str:
+    if timeframe_mode in {"1h", "1h_primary", "hybrid"}:
+        return "1H主导 / 15m触发"
+    if timeframe_mode == "15m":
+        return "15m快速模式"
+    return timeframe_mode
+
+
+def _human_trigger(trigger_source: str) -> str:
+    mapping = {
+        "bb_mid_reclaim": "布林中轨收复",
+        "bb_mid_reject": "布林中轨压回",
+        "structure_breakout": "结构突破",
+        "structure_breakdown": "结构跌破",
+    }
+    return mapping.get(trigger_source, trigger_source)

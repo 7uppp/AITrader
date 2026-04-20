@@ -90,7 +90,14 @@ def _snapshot() -> MarketSnapshot:
 
 def test_build_advisory_for_long():
     cfg = _cfg()
-    sig = SignalIntent(symbol="BTCUSDT", side=Side.LONG, entry_price=100.0, initial_stop=96.0, confidence=0.8)
+    sig = SignalIntent(
+        symbol="BTCUSDT",
+        side=Side.LONG,
+        entry_price=100.0,
+        initial_stop=96.0,
+        confidence=0.8,
+        reason_codes=["trigger:bb_mid_reclaim", "timeframe:1h_primary"],
+    )
     decision = RiskDecision(approved=True, reason_codes=["risk:approved"], quantity=0.25)
     ad = build_trade_advisory(cfg, _snapshot(), sig, decision, atr_15m=1.2)
     assert ad.main_take_profit == 104.0
@@ -101,6 +108,8 @@ def test_build_advisory_for_long():
     assert ad.advice_id.startswith("A-BTC")
     text = advisory_to_telegram_text(ad, _snapshot())
     assert "AdviceID" in text
+    assert "1H主导 / 15m触发" in text
+    assert "触发类型: 布林中轨收复" in text
     assert "触发开仓价" in text
     assert "主仓建议(60%)" in text
     assert "1R定义" in text

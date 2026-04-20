@@ -19,6 +19,22 @@ runner_trailing_activation_r = 1.5
 runner_trailing_atr_mult = 2.2
 runner_trailing_atr_mult_tight = 1.8
 risk_extreme_mode_tighten_trailing = true
+primary_timeframe_mode = "1h_primary"
+use_4h_trend_bias = true
+ema_fast_period = 20
+ema_mid_period = 50
+ema_slow_period = 200
+rsi_period = 14
+rsi_long_min = 45.0
+rsi_long_max = 68.0
+rsi_short_min = 32.0
+rsi_short_max = 55.0
+bb_period = 20
+bb_stddev = 2.0
+trigger_breakout_lookback_15m = 6
+trigger_volume_sma_period = 20
+trigger_volume_multiplier = 1.0
+signal_min_confidence = 0.58
 
 [risk]
 single_trade_risk_pct = 0.25
@@ -51,7 +67,7 @@ dry_run = true
 loop_interval_seconds = 15
 advisory_only = true
 telegram_offset_path = "data/telegram_offset.txt"
-advisory_cooldown_minutes = 45
+advisory_cooldown_minutes = 10
 
 [binance]
 base_url = "https://fapi.binance.com"

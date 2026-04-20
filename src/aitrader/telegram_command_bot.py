@@ -8,7 +8,7 @@ from .runtime import TradingRuntime
 from .telegram_notify import TelegramNotifier
 from .time_utils import utc_now
 
-SUPPORTED_TIMEFRAMES = {"15m", "1h", "hybrid", "auto"}
+SUPPORTED_TIMEFRAMES = {"15m", "1h", "hybrid", "1h_primary", "auto"}
 COMPACT_SYMBOLS = {
     "btc": "BTCUSDT",
     "eth": "ETHUSDT",
