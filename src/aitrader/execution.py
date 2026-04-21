@@ -53,6 +53,10 @@ class PaperExecutionAdapter:
             return
         self.orders = [order for order in self.orders if order.symbol != symbol]
 
+    def submit_protection_orders(self, symbol: str, side: Side, quantity: float, stop_price: float, main_tp_price: float) -> dict[str, object]:
+        _ = symbol, side, quantity, stop_price, main_tp_price
+        return {"status": "DRY_RUN", "reason": "paper_adapter"}
+
 
 @dataclass(slots=True)
 class ExecutionEngine:

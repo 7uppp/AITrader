@@ -13,13 +13,20 @@ class TelegramNotifier:
     timeout_seconds: float = 8.0
 
     def enabled(self) -> bool:
-        return self.config.enabled and bool(self.config.bot_token) and bool(self.config.chat_id)
+        return self.config.enabled and bool(self.config.bot_token)
 
     def send_text(self, text: str) -> tuple[bool, str]:
         if not self.enabled():
             return (False, "telegram_disabled_or_missing_credentials")
+        if not self.config.chat_id:
+            return (False, "telegram_missing_default_chat_id")
+        return self.send_text_to_chat(chat_id=self.config.chat_id, text=text)
+
+    def send_text_to_chat(self, chat_id: str, text: str) -> tuple[bool, str]:
+        if not self.enabled():
+            return (False, "telegram_disabled_or_missing_credentials")
         payload = {
-            "chat_id": self.config.chat_id,
+            "chat_id": str(chat_id),
             "text": text,
             "disable_web_page_preview": True,
         }

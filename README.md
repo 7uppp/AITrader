@@ -1,15 +1,16 @@
 # AiTrader
 
-Conservative, risk-first Binance USDT-margined USDⓈ-M signal advisory bot skeleton.
+Conservative, risk-first crypto trading bot skeleton with Hyperliquid execution support and Telegram control.
 
-## What is implemented in this baseline
+## What is implemented
 
-- Modular architecture: market data, signal, risk, advisory runtime, telegram control.
-- Normal-trading strategy skeleton: 1H trend/setup + 15m trigger, EMA + RSI + Bollinger + volume, split-position (main + runner), fixed + trailing exits.
-- Hard risk checks: daily/weekly loss caps, max drawdown stop, open risk limits, liquidation buffer guardrail.
-- Kill-switch oriented control model with `RUNNING / PAUSED / RISK_OFF / KILLED`.
-- Persistence bootstrap schema for snapshots, signals, decisions, and operator events.
-- Unit tests for critical safety behavior.
+- Modular architecture: market data, signal, risk, advisory runtime, auto execution, Telegram control.
+- Mid-frequency strategy skeleton: 1H trend/setup + 15m trigger, EMA + RSI + Bollinger + volume, split position (main + runner).
+- Hard risk checks: daily/weekly loss caps, drawdown cap, max open risk, liquidation buffer guardrail.
+- Auto candidate ranking and risk-budget allocation (not all-in).
+- Telegram commands for scan, status, active suggestions, alive check, and result logging.
+- Shared Telegram access with role control: `viewer`, `trader`, `admin`.
+- Dangerous admin actions (`/closeall`, `/killswitch`) require `/confirm CODE`.
 
 ## Quick start
 
@@ -25,58 +26,48 @@ pip install -e .[dev]
 pytest -q
 ```
 
-3. Run the demo backtest workflow
-
-```bash
-python -m aitrader demo
-```
-
-4. Run one live-data advisory cycle (public Binance market data + Telegram advisory push)
+3. Run one cycle
 
 ```bash
 python -m aitrader cycle --config config.example.toml
 ```
 
-5. Analyze now from CLI without placing orders
-
-```bash
-python -m aitrader scan --symbols BTCUSDT,ETHUSDT,BNBUSDT,DOTUSDT,SOLUSDT --tf auto
-```
-
-6. Poll Telegram once and handle commands (`/scan`, `/scan BTCUSDT`, `/status`)
+4. Run Telegram polling once
 
 ```bash
 python -m aitrader tg-once --config config.example.toml
 ```
 
-7. Keep Telegram listener running (no need to trigger `tg-once` manually each time)
-
-```bash
-python -m aitrader tg-loop --config config.example.toml --poll-timeout 25
-```
-
-8. Run 24/7 push mode (auto-scan whitelist + Telegram command listener in one process)
+5. Run 24/7 service loop
 
 ```bash
 python -m aitrader serve --config config.example.toml --scan-seconds 60 --poll-timeout 25
-
-# Security-first (recommended): keep token/chat_id out of TOML
-# PowerShell:
-$env:AITRADER_TELEGRAM_BOT_TOKEN="your_bot_token"
-$env:AITRADER_TELEGRAM_CHAT_ID="your_chat_id"
-python -m aitrader serve --config config.example.toml --scan-seconds 60 --poll-timeout 25
 ```
+
+## Hyperliquid live mode safety switch
+
+Default config is safe mode (`dry_run=true`, `advisory_only=true`, `auto_trade_enabled=false`).
+
+To enable live auto-trade, you must explicitly set all three:
+
+- `runtime.dry_run=false`
+- `runtime.advisory_only=false`
+- `runtime.auto_trade_enabled=true`
+
+Recommended secret injection (do not store private key in TOML):
+
+- `AITRADER_HL_PRIVATE_KEY`
+- `AITRADER_HL_VAULT_ADDRESS` (optional)
+- `AITRADER_TELEGRAM_BOT_TOKEN`
+- `AITRADER_TELEGRAM_CHAT_ID`
+- `AITRADER_TELEGRAM_ALLOWED_CHAT_IDS` (comma-separated, optional)
+- `AITRADER_TELEGRAM_ADMIN_USER_IDS` (comma-separated, optional)
+- `AITRADER_TELEGRAM_TRADER_USER_IDS` (comma-separated, optional)
+- `AITRADER_TELEGRAM_VIEWER_USER_IDS` (comma-separated, optional)
 
 ## Notes
 
-- This repository is a production-oriented skeleton, not a complete live-ready trading system.
-- Current runtime is advisory-only: it does not place exchange orders.
-- Before enabling notifications, fill `[telegram]` bot token/chat id in your own config file, or inject via env vars.
-- Command-driven mode: the bot can stay idle and only analyze when it receives Telegram `/scan` commands.
-- In auto-push mode, only suitable advisories are sent by default; `/scan` can still show unsuitable results on demand.
-- Default strategy mode is `1h_primary`: 1H-led direction/setup with 15m trigger and a shorter 10-minute advisory cooldown.
-- Short Telegram commands supported: `btc15m`, `eth1h`, `bnb15m`, `dot1h`, `solauto`.
-- Bot menu includes `/scan`, `/alive`, `/status`, `/help`, `/result`, `/win`, `/loss`.
-- Budget input supported for split sizing display: `/scan BTCUSDT 500` or `btc15m 500`.
-- Manual close outcome logging supported: `/result <AdviceID> win 1.2` (recommended), `/win SOLUSDT 0.8`, `/loss ETHUSDT -0.6`.
-- Advisory message includes confidence-based leverage suggestion (never above hard limit and 5x).
+- This is a production-oriented skeleton, not a finished HFT or market-making system.
+- In live mode, execution is blocked if protection-order support is unavailable.
+- Leverage suggestion is confidence-based and always capped by hard limit and 5x.
+- If no user role lists are configured, allowed users default to admin.

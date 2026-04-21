@@ -1,21 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 from pathlib import Path
+from typing import Any
 
 import httpx
 
-from .advisory import advisory_to_telegram_text, build_trade_advisory
+from .advisory import TradeAdvisory, advisory_to_telegram_text, build_trade_advisory
 from .audit import config_hash
 from .binance_market_data import BinanceMarketDataClient
+from .execution import ExecutionEngine, PaperExecutionAdapter
 from .config import AppConfig
+from .hyperliquid_live import HyperliquidLiveAdapter
+from .hyperliquid_market_data import HyperliquidMarketDataClient
 from .market_data import MarketDataPolicy, MarketDataValidator
+from .position_manager import PositionManager
 from .risk import RiskEngine
-from .storage import Storage
+from .storage import ActiveAdvice, Storage
 from .strategy import SignalEngine, TimeframeMode
 from .telegram_notify import TelegramNotifier
 from .time_utils import utc_now
-from .types import AccountState, MarketSnapshot, SignalIntent, SystemMode
+from .types import AccountState, MarketSnapshot, Side, SignalIntent, SystemMode
 
 
 SIGNAL_REASON_MAP: dict[str, str] = {
@@ -93,9 +99,17 @@ class SymbolAnalysis:
 
 
 @dataclass(slots=True)
+class AutoTradeCandidate:
+    symbol: str
+    advice_id: str
+    advisory: TradeAdvisory
+    score: float
+
+
+@dataclass(slots=True)
 class TradingRuntime:
     config: AppConfig
-    data_client: BinanceMarketDataClient
+    data_client: Any
     signal_engine: SignalEngine
     risk_engine: RiskEngine
     notifier: TelegramNotifier
@@ -103,15 +117,36 @@ class TradingRuntime:
     storage: Storage
     mode: SystemMode
     account: AccountState
+    position_manager: PositionManager
+    execution_engine: ExecutionEngine | None = None
 
     @classmethod
     def from_config(cls, cfg: AppConfig) -> "TradingRuntime":
         storage = Storage(Path(cfg.runtime.database_path))
         storage.path.parent.mkdir(parents=True, exist_ok=True)
         storage.init_schema()
+        exchange_kind = cfg.exchange.kind.strip().lower()
+        if exchange_kind == "hyperliquid":
+            data_client: Any = HyperliquidMarketDataClient(cfg.hyperliquid)
+        else:
+            data_client = BinanceMarketDataClient(cfg.binance)
+
+        execution_engine: ExecutionEngine | None = None
+        if cfg.runtime.auto_trade_enabled:
+            if exchange_kind == "hyperliquid":
+                execution_engine = ExecutionEngine(
+                    adapter=HyperliquidLiveAdapter(
+                        config=cfg.hyperliquid,
+                        dry_run=cfg.runtime.dry_run,
+                    )
+                )
+            else:
+                execution_engine = ExecutionEngine(adapter=PaperExecutionAdapter())
+
+        equity = max(100.0, float(cfg.runtime.assumed_equity_usd))
         runtime = cls(
             config=cfg,
-            data_client=BinanceMarketDataClient(cfg.binance),
+            data_client=data_client,
             signal_engine=SignalEngine(cfg.trading, cfg.strategy),
             risk_engine=RiskEngine(cfg.trading, cfg.risk),
             notifier=TelegramNotifier(cfg.telegram),
@@ -119,8 +154,8 @@ class TradingRuntime:
             storage=storage,
             mode=cfg.system.mode,
             account=AccountState(
-                equity=10_000.0,
-                free_margin=8_000.0,
+                equity=equity,
+                free_margin=equity,
                 daily_pnl_pct=0.0,
                 weekly_pnl_pct=0.0,
                 drawdown_pct=0.0,
@@ -129,17 +164,21 @@ class TradingRuntime:
                 open_risk_pct=0.0,
                 symbol_notional_pct=0.0,
             ),
+            position_manager=PositionManager(cfg.strategy, cfg.risk),
+            execution_engine=execution_engine,
         )
         runtime._record_config_version()
-        if not cfg.runtime.advisory_only:
+        if cfg.runtime.auto_trade_enabled and cfg.runtime.advisory_only:
             runtime.storage.insert_system_event(
                 utc_now(),
-                "runtime_guardrail",
-                {"message": "advisory_only=false configured, but runtime remains advisory-only by design"},
+                "runtime_auto_trade_disabled",
+                {"message": "auto_trade_enabled=true but advisory_only=true, skip live execution"},
             )
         return runtime
 
     def run_cycle(self) -> RuntimeResult:
+        if self.config.runtime.auto_trade_enabled and not self.config.runtime.advisory_only:
+            return self._run_auto_trade_cycle()
         analyses = self.analyze_symbols(self.config.trading.symbols, push_to_telegram=True, timeframe_mode="auto")
         result = RuntimeResult(processed_symbols=len(analyses))
         for analysis in analyses:
@@ -184,6 +223,275 @@ class TradingRuntime:
                 )
             )
         return outputs
+
+    def _run_auto_trade_cycle(self) -> RuntimeResult:
+        analyses = self.analyze_symbols(self.config.trading.symbols, push_to_telegram=False, timeframe_mode="auto")
+        result = RuntimeResult(processed_symbols=len(analyses))
+        candidates = self._collect_auto_candidates(analyses)
+        result.signals = len(candidates)
+        selected = self._select_auto_candidates(candidates)
+        skipped = max(0, len(candidates) - len(selected))
+        if skipped > 0:
+            self.storage.insert_system_event(
+                utc_now(),
+                "auto_trade_candidates_skipped",
+                {"candidate_count": len(candidates), "selected_count": len(selected)},
+            )
+
+        for candidate in selected:
+            ok = self._execute_candidate(candidate)
+            if ok:
+                result.approved += 1
+                result.advisories_generated += 1
+                result.advisories_sent += 1
+            else:
+                result.rejected += 1
+
+        result.rejected += sum(1 for a in analyses if not a.suitable)
+        return result
+
+    def _collect_auto_candidates(self, analyses: list[SymbolAnalysis]) -> list[AutoTradeCandidate]:
+        candidates: list[AutoTradeCandidate] = []
+        for analysis in analyses:
+            if not analysis.suitable:
+                continue
+            advice_id = self._extract_reason_value(analysis.reasons, "advice_id")
+            if not advice_id:
+                continue
+            if "active_advice_exists" in analysis.reasons:
+                continue
+            row = self.storage.get_advice_record(advice_id)
+            if row is None:
+                continue
+            payload = self._safe_load_json(str(row["payload_json"]))
+            advisory_raw = payload.get("advisory")
+            if not isinstance(advisory_raw, dict):
+                continue
+            advisory = self._advisory_from_payload(advisory_raw)
+            score = self._candidate_score(advisory)
+            candidates.append(
+                AutoTradeCandidate(
+                    symbol=analysis.symbol,
+                    advice_id=advice_id,
+                    advisory=advisory,
+                    score=score,
+                )
+            )
+        return candidates
+
+    def _select_auto_candidates(self, candidates: list[AutoTradeCandidate]) -> list[AutoTradeCandidate]:
+        if not candidates:
+            return []
+        self._refresh_account_for_symbol(symbol="")
+        max_positions = max(0, self.config.risk.max_open_positions - self.account.open_positions)
+        max_candidates = max(1, self.config.runtime.max_candidates_per_cycle)
+        remaining_slots = min(max_positions, max_candidates)
+        if remaining_slots <= 0:
+            return []
+
+        risk_left = max(0.0, self.config.risk.max_open_risk_pct - self.account.open_risk_pct)
+        picked: list[AutoTradeCandidate] = []
+        seen_symbols: set[str] = set()
+        sorted_candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
+        for c in sorted_candidates:
+            if remaining_slots <= 0 or risk_left <= 0:
+                break
+            if c.symbol in seen_symbols:
+                continue
+            if self._has_active_lots(c.symbol):
+                continue
+            scaled_qty = self._scale_quantity_by_budget(c.advisory.suggested_quantity, risk_left)
+            if scaled_qty <= 0:
+                continue
+            c.advisory.suggested_quantity = scaled_qty
+            c.advisory.main_quantity = scaled_qty * self.config.strategy.main_lot_ratio
+            c.advisory.runner_quantity = scaled_qty * self.config.strategy.runner_lot_ratio
+            picked.append(c)
+            seen_symbols.add(c.symbol)
+            remaining_slots -= 1
+            risk_left -= min(self.config.risk.single_trade_risk_pct, risk_left)
+        return picked
+
+    def _execute_candidate(self, candidate: AutoTradeCandidate) -> bool:
+        if self.execution_engine is None:
+            self.storage.insert_system_event(
+                utc_now(),
+                "auto_trade_no_execution_engine",
+                {"advice_id": candidate.advice_id, "symbol": candidate.symbol},
+            )
+            return False
+
+        adapter = self.execution_engine.adapter
+        if not self.config.runtime.dry_run and not hasattr(adapter, "submit_protection_orders"):
+            self.storage.insert_system_event(
+                utc_now(),
+                "auto_trade_missing_protection_support",
+                {"advice_id": candidate.advice_id, "symbol": candidate.symbol},
+            )
+            return False
+
+        side = candidate.advisory.side
+        symbol = candidate.symbol
+        main_qty = max(0.0, candidate.advisory.main_quantity)
+        runner_qty = max(0.0, candidate.advisory.runner_quantity)
+        if main_qty <= 0 and runner_qty <= 0:
+            return False
+
+        try:
+            entry_price = candidate.advisory.entry_trigger
+            if main_qty > 0:
+                main_order = self.execution_engine.place(
+                    request_id=f"{candidate.advice_id}-main",
+                    symbol=symbol,
+                    side=side,
+                    quantity=main_qty,
+                    price=entry_price,
+                    reduce_only=False,
+                )
+                if main_order is not None:
+                    self.storage.insert_order(utc_now(), main_order.client_order_id, symbol, side.value, main_order.status, main_order)
+            if runner_qty > 0:
+                runner_order = self.execution_engine.place(
+                    request_id=f"{candidate.advice_id}-runner",
+                    symbol=symbol,
+                    side=side,
+                    quantity=runner_qty,
+                    price=entry_price,
+                    reduce_only=False,
+                )
+                if runner_order is not None:
+                    self.storage.insert_order(utc_now(), runner_order.client_order_id, symbol, side.value, runner_order.status, runner_order)
+
+            total_qty = main_qty + runner_qty
+            if total_qty > 0 and hasattr(adapter, "submit_protection_orders"):
+                adapter.submit_protection_orders(
+                    symbol=symbol,
+                    side=side,
+                    quantity=total_qty,
+                    stop_price=candidate.advisory.stop_loss,
+                    main_tp_price=candidate.advisory.main_take_profit,
+                )
+
+            signal = SignalIntent(
+                symbol=symbol,
+                side=side,
+                entry_price=entry_price,
+                initial_stop=candidate.advisory.stop_loss,
+                confidence=candidate.advisory.confidence,
+                reason_codes=[f"advice_id:{candidate.advice_id}"],
+            )
+            self.position_manager.open_split_position(signal=signal, quantity=total_qty)
+            self._refresh_account_for_symbol(symbol=symbol)
+
+            msg = (
+                "[AUTO EXECUTED]\n"
+                f"exchange={self.config.exchange.kind}\n"
+                f"score={candidate.score:.3f}\n"
+                f"symbol={symbol} side={side.value}\n"
+                f"entry={entry_price:.6f} stop={candidate.advisory.stop_loss:.6f} tp_main={candidate.advisory.main_take_profit:.6f}\n"
+                f"qty_total={total_qty:.6f} main={main_qty:.6f} runner={runner_qty:.6f}\n"
+                f"advice_id={candidate.advice_id}"
+            )
+            sent, reason = self.notifier.send_text(msg[:3800])
+            self.storage.insert_system_event(
+                utc_now(),
+                "auto_trade_executed",
+                {
+                    "advice_id": candidate.advice_id,
+                    "symbol": symbol,
+                    "score": candidate.score,
+                    "main_qty": main_qty,
+                    "runner_qty": runner_qty,
+                    "telegram_sent": sent,
+                    "telegram_reason": reason,
+                },
+            )
+            return True
+        except Exception as exc:
+            self.storage.insert_system_event(
+                utc_now(),
+                "auto_trade_execute_error",
+                {"advice_id": candidate.advice_id, "symbol": symbol, "error": type(exc).__name__, "message": str(exc)},
+            )
+            return False
+
+    def _scale_quantity_by_budget(self, quantity: float, risk_left_pct: float) -> float:
+        if quantity <= 0:
+            return 0.0
+        base_risk = max(0.0001, self.config.risk.single_trade_risk_pct)
+        scale = min(1.0, max(0.0, risk_left_pct / base_risk))
+        return quantity * scale
+
+    def _has_active_lots(self, symbol: str) -> bool:
+        for lot in self.position_manager.lots:
+            if lot.active and lot.symbol.upper() == symbol.upper():
+                return True
+        return False
+
+    @staticmethod
+    def _extract_reason_value(reasons: list[str], key: str) -> str | None:
+        prefix = f"{key}:"
+        for reason in reasons:
+            if reason.startswith(prefix):
+                return reason[len(prefix) :].strip() or None
+        return None
+
+    @staticmethod
+    def _candidate_score(advisory: TradeAdvisory) -> float:
+        score = advisory.confidence
+        if advisory.timeframe_mode in {"1h_primary", "1h", "hybrid"}:
+            score += 0.04
+        if advisory.recommended_leverage <= 1.0:
+            score -= 0.03
+        return round(score, 4)
+
+    @staticmethod
+    def _safe_load_json(raw: str) -> dict[str, object]:
+        try:
+            out = json.loads(raw)
+            return out if isinstance(out, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    @staticmethod
+    def _advisory_from_payload(payload: dict[str, object]) -> TradeAdvisory:
+        side = payload.get("side", "LONG")
+        side_value = side if isinstance(side, str) else str(side)
+        if "LONG" in side_value.upper():
+            side_enum = Side.LONG
+        elif "SHORT" in side_value.upper():
+            side_enum = Side.SHORT
+        else:
+            side_enum = Side.LONG
+        return TradeAdvisory(
+            advice_id=str(payload.get("advice_id", "")),
+            symbol=str(payload.get("symbol", "")),
+            side=side_enum,
+            trigger_source=str(payload.get("trigger_source", "pending")),
+            entry_trigger=float(payload.get("entry_trigger", 0.0)),
+            entry_zone_low=float(payload.get("entry_zone_low", 0.0)),
+            entry_zone_high=float(payload.get("entry_zone_high", 0.0)),
+            stop_loss=float(payload.get("stop_loss", 0.0)),
+            main_take_profit=float(payload.get("main_take_profit", 0.0)),
+            runner_activation_price=float(payload.get("runner_activation_price", 0.0)),
+            runner_trailing_atr_mult=float(payload.get("runner_trailing_atr_mult", 0.0)),
+            suggested_quantity=float(payload.get("suggested_quantity", 0.0)),
+            main_lot_ratio=float(payload.get("main_lot_ratio", 0.6)),
+            runner_lot_ratio=float(payload.get("runner_lot_ratio", 0.4)),
+            main_quantity=float(payload.get("main_quantity", 0.0)),
+            runner_quantity=float(payload.get("runner_quantity", 0.0)),
+            risk_distance=float(payload.get("risk_distance", 0.0)),
+            confidence=float(payload.get("confidence", 0.0)),
+            recommended_leverage=float(payload.get("recommended_leverage", 1.0)),
+            recommended_leverage_reason=str(payload.get("recommended_leverage_reason", "")),
+            timeframe_mode=str(payload.get("timeframe_mode", "auto")),
+            valid_minutes=int(payload.get("valid_minutes", 30)),
+            manual_total_usdt=float(payload["manual_total_usdt"]) if payload.get("manual_total_usdt") is not None else None,
+            manual_main_usdt=float(payload["manual_main_usdt"]) if payload.get("manual_main_usdt") is not None else None,
+            manual_runner_usdt=float(payload["manual_runner_usdt"]) if payload.get("manual_runner_usdt") is not None else None,
+            manual_main_quantity=float(payload["manual_main_quantity"]) if payload.get("manual_main_quantity") is not None else None,
+            manual_runner_quantity=float(payload["manual_runner_quantity"]) if payload.get("manual_runner_quantity") is not None else None,
+        )
 
     def _analyze_one_symbol(
         self,
@@ -310,6 +618,42 @@ class TradingRuntime:
             atr_15m=atr_15m,
             manual_total_usdt=manual_total_usdt,
         )
+        active_advice = self.storage.get_active_advice(symbol=symbol, side=signal.side.value, now=utc_now())
+        if active_advice is not None:
+            if push_to_telegram:
+                message = self._format_active_skip_message(symbol=symbol, side=signal.side.value, active=active_advice)
+                self.storage.insert_system_event(
+                    utc_now(),
+                    "active_advice_skip",
+                    {
+                        "symbol": symbol,
+                        "side": signal.side.value,
+                        "active_advice_id": active_advice.advice_id,
+                        "remaining_minutes": active_advice.remaining_minutes,
+                    },
+                )
+                return SymbolAnalysis(
+                    symbol=symbol,
+                    suitable=False,
+                    message=message,
+                    reasons=["active_advice_exists"],
+                    timeframe_mode=selected_mode,
+                )
+            message = self._format_manual_reference_message(
+                symbol=symbol,
+                side=signal.side.value,
+                advisory=advisory,
+                snapshot=snapshot,
+                mode=selected_mode,
+                active=active_advice,
+            )
+            return SymbolAnalysis(
+                symbol=symbol,
+                suitable=True,
+                message=message,
+                reasons=["active_advice_exists", "manual_reference_only"],
+                timeframe_mode=selected_mode,
+            )
         if push_to_telegram and self.storage.recent_advice_exists(
             symbol=symbol,
             side=signal.side.value,
@@ -350,16 +694,34 @@ class TradingRuntime:
             symbol=symbol,
             suitable=True,
             message=message,
-            reasons=["advisory_generated", "[telegram:sent]" if sent else "[telegram:not_sent]"],
+            reasons=[
+                "advisory_generated",
+                f"advice_id:{advisory.advice_id}",
+                "[telegram:sent]" if sent else "[telegram:not_sent]",
+            ],
             timeframe_mode=selected_mode,
         )
 
     def _refresh_account_for_symbol(self, symbol: str) -> None:
-        _ = symbol
-        # Advisory-only mode intentionally keeps exposure at zero.
-        self.account.open_positions = 0
-        self.account.open_risk_pct = 0.0
-        self.account.symbol_notional_pct = 0.0
+        active_lots = [lot for lot in self.position_manager.lots if lot.active]
+        unique_positions = {(lot.symbol.upper(), lot.side.value) for lot in active_lots}
+        self.account.open_positions = len(unique_positions)
+        self.account.open_risk_pct = min(
+            self.config.risk.max_open_risk_pct,
+            float(self.account.open_positions) * self.config.risk.single_trade_risk_pct,
+        )
+        if not symbol:
+            self.account.symbol_notional_pct = 0.0
+            return
+        symbol_upper = symbol.upper()
+        symbol_notional = 0.0
+        for lot in active_lots:
+            if lot.symbol.upper() == symbol_upper:
+                symbol_notional += lot.quantity * lot.avg_entry
+        if self.account.equity > 0:
+            self.account.symbol_notional_pct = (symbol_notional / self.account.equity) * 100.0
+        else:
+            self.account.symbol_notional_pct = 0.0
 
     def _record_config_version(self) -> None:
         payload = asdict(self.config)
@@ -434,3 +796,37 @@ class TradingRuntime:
         if period <= 0:
             return 0.0
         return sum(tr[-period:]) / float(period)
+
+    @staticmethod
+    def _format_active_skip_message(symbol: str, side: str, active: ActiveAdvice) -> str:
+        side_cn = "做多" if side.upper() == "LONG" else "做空"
+        entry_text = f"{active.entry_trigger:.4f}" if active.entry_trigger is not None else "-"
+        return (
+            f"[跳过] {symbol}\n"
+            f"原因: 已有未结束的{side_cn}建议({active.advice_id})\n"
+            f"原建议开仓价: {entry_text}\n"
+            f"剩余有效期: 约{active.remaining_minutes}分钟\n"
+            "说明: 等待 /result 回报或建议过期后，再接收新的同向推送。"
+        )
+
+    @staticmethod
+    def _format_manual_reference_message(
+        symbol: str,
+        side: str,
+        advisory: TradeAdvisory,
+        snapshot: MarketSnapshot,
+        mode: str,
+        active: ActiveAdvice,
+    ) -> str:
+        side_cn = "做多" if side.upper() == "LONG" else "做空"
+        active_entry = f"{active.entry_trigger:.4f}" if active.entry_trigger is not None else "-"
+        return (
+            f"[参考] {symbol} {side_cn}\n"
+            f"判定框架: {mode}\n"
+            f"当前分析开仓触发价: {advisory.entry_trigger:.4f}\n"
+            f"当前分析止损价: {advisory.stop_loss:.4f}\n"
+            f"当前分析主仓止盈: {advisory.main_take_profit:.4f}\n"
+            f"Mark/Funding/OI: {snapshot.mark_price:.4f} / {snapshot.funding_rate_pct:.4f}% / {snapshot.oi_change_1h_pct:.2f}%\n"
+            f"已有活动建议: {active.advice_id} (开仓价{active_entry}, 剩余约{active.remaining_minutes}分钟)\n"
+            "说明: 本次为手动查询参考，不会生成新的同向推送建议。"
+        )

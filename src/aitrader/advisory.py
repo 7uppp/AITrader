@@ -70,13 +70,14 @@ def build_trade_advisory(
         else cfg.strategy.runner_trailing_atr_mult
     )
     timeframe_mode = "hybrid"
-    trigger_source = "待触发"
+    trigger_source = "pending"
     for code in signal.reason_codes:
         if code.startswith("timeframe:"):
             timeframe_mode = code.split(":", maxsplit=1)[1]
         if code.startswith("trigger:"):
             trigger_source = code.split(":", maxsplit=1)[1]
     valid_minutes = 90 if timeframe_mode in {"1h", "1h_primary"} else (20 if timeframe_mode == "15m" else 45)
+
     main_usdt = None
     runner_usdt = None
     main_qty_by_usdt = None
@@ -86,6 +87,7 @@ def build_trade_advisory(
         runner_usdt = manual_total_usdt * cfg.strategy.runner_lot_ratio
         main_qty_by_usdt = main_usdt / signal.entry_price
         runner_qty_by_usdt = runner_usdt / signal.entry_price
+
     recommended_lev, lev_reason = _recommended_leverage(
         confidence=signal.confidence,
         timeframe_mode=timeframe_mode,
@@ -128,6 +130,7 @@ def advisory_to_telegram_text(ad: TradeAdvisory, snapshot: MarketSnapshot) -> st
     side_cn = "做多" if ad.side == Side.LONG else "做空"
     timeframe_label = _human_timeframe(ad.timeframe_mode)
     trigger_label = _human_trigger(ad.trigger_source)
+    short_id = str(ad.advice_id).split("-")[-1]
     extra_manual = ""
     if ad.manual_total_usdt is not None and ad.manual_total_usdt > 0:
         extra_manual = (
@@ -139,6 +142,7 @@ def advisory_to_telegram_text(ad: TradeAdvisory, snapshot: MarketSnapshot) -> st
     return (
         f"[交易建议] {ad.symbol} {side_cn}\n"
         f"AdviceID: {ad.advice_id}\n"
+        f"ShortID: {short_id}\n"
         f"判定框架: {timeframe_label}\n"
         f"触发类型: {trigger_label}\n"
         f"建议有效期: 约{ad.valid_minutes}分钟\n"
@@ -157,7 +161,9 @@ def advisory_to_telegram_text(ad: TradeAdvisory, snapshot: MarketSnapshot) -> st
         f"信号置信度: {ad.confidence:.2f}\n"
         f"建议杠杆: {ad.recommended_leverage:.1f}x ({ad.recommended_leverage_reason})\n"
         f"Mark/Funding/OI: {snapshot.mark_price:.4f} / {snapshot.funding_rate_pct:.4f}% / {snapshot.oi_change_1h_pct:.2f}%\n"
-        f"平仓回报: /result {ad.advice_id} win 1.2"
+        f"快速回报(短码): /result {short_id} win 1.2\n"
+        f"完整回报: /result {ad.advice_id} win 1.2\n"
+        "最近建议回报: /result last win 1.2"
     )
 
 

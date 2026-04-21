@@ -68,9 +68,23 @@ loop_interval_seconds = 15
 advisory_only = true
 telegram_offset_path = "data/telegram_offset.txt"
 advisory_cooldown_minutes = 10
+assumed_equity_usd = 10000.0
+auto_trade_enabled = false
+max_candidates_per_cycle = 3
+execution_cooldown_seconds = 600
+
+[exchange]
+kind = "hyperliquid"
 
 [binance]
 base_url = "https://fapi.binance.com"
+request_timeout_seconds = 8.0
+
+[hyperliquid]
+api_url = "https://api.hyperliquid.xyz"
+ws_url = "wss://api.hyperliquid.xyz/ws"
+vault_address = ""
+private_key = ""
 request_timeout_seconds = 8.0
 
 [telegram]
@@ -78,3 +92,8 @@ enabled = true
 bot_token = "REPLACE_WITH_YOUR_BOT_TOKEN"
 chat_id = "REPLACE_WITH_YOUR_CHAT_ID"
 send_rejections = true
+allowed_chat_ids = []
+admin_user_ids = []
+trader_user_ids = []
+viewer_user_ids = []
+confirm_ttl_seconds = 45

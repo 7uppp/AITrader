@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from aitrader.config import TelegramConfig
 from aitrader.telegram_command_bot import TelegramCommandBot
+from aitrader.types import SystemMode
 
 
 def _bot(tmp_path: Path) -> TelegramCommandBot:
@@ -14,6 +15,11 @@ def _bot(tmp_path: Path) -> TelegramCommandBot:
             self.commands: list[dict[str, str]] = []
 
         def send_text(self, text: str) -> tuple[bool, str]:
+            self.sent_texts.append(text)
+            return (True, "ok")
+
+        def send_text_to_chat(self, chat_id: str, text: str) -> tuple[bool, str]:
+            _ = chat_id
             self.sent_texts.append(text)
             return (True, "ok")
 
@@ -32,6 +38,9 @@ def _bot(tmp_path: Path) -> TelegramCommandBot:
         close_advice_record=lambda *args, **kwargs: None,
         has_feedback_for_advice=lambda advice_id: False,
         trade_feedback_stats=lambda symbol=None: {"total": 0, "wins": 0, "losses": 0, "win_rate_pct": 0.0},
+        list_active_advices=lambda now=None: [],
+        get_latest_active_advice=lambda now=None: None,
+        get_advice_ids_by_suffix=lambda suffix, status=None, limit=20: [],
     )
     runtime = SimpleNamespace(
         config=SimpleNamespace(
@@ -40,7 +49,8 @@ def _bot(tmp_path: Path) -> TelegramCommandBot:
         notifier=_NotifierStub(),
         storage=storage_stub,
         analyze_symbols=lambda symbols, push_to_telegram=False, timeframe_mode="auto", manual_total_usdt=None: [],
-        mode=SimpleNamespace(value="RUNNING"),
+        mode=SystemMode.RUNNING,
+        _refresh_account_for_symbol=lambda symbol="": None,
     )
     return TelegramCommandBot(runtime=runtime, notifier=runtime.notifier, offset_path=tmp_path / "offset.txt")
 
@@ -124,12 +134,89 @@ def test_parse_result_command_with_advice_id():
     assert parsed == ("A-BTC-1H-20260420153012-ABC123", None, "WIN", 1.2, "")
 
 
+def test_resolve_advice_target_with_short_id(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot.runtime.storage.get_advice_ids_by_suffix = lambda suffix, status=None, limit=20: ["A-BTC-1H-20260420153012-ABC123"]
+    resolved, err = bot._resolve_advice_target("abc123", now=None)
+    assert err is None
+    assert resolved == "A-BTC-1H-20260420153012-ABC123"
+
+
+def test_resolve_advice_target_with_last(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot.runtime.storage.get_latest_active_advice = lambda now=None: SimpleNamespace(advice_id="A-ETH-1H-20260420153012-XYZ789")
+    resolved, err = bot._resolve_advice_target("last", now=None)
+    assert err is None
+    assert resolved == "A-ETH-1H-20260420153012-XYZ789"
+
+
 def test_menu_commands_and_alive_command(tmp_path: Path):
     bot = _bot(tmp_path)
     ok, reason = bot.ensure_menu_commands()
     assert ok
     assert reason == "ok"
-    assert [item["command"] for item in bot.notifier.commands] == ["scan", "alive", "status", "help", "result", "win", "loss"]
+    assert [item["command"] for item in bot.notifier.commands] == [
+        "scan",
+        "positions",
+        "active",
+        "alive",
+        "status",
+        "help",
+        "result",
+        "pause",
+        "resume",
+        "riskoff",
+        "closeall",
+        "killswitch",
+    ]
 
     bot._handle_text_command("/alive")
     assert any("bot alive" in text for text in bot.notifier.sent_texts)
+
+
+def test_active_command_with_no_open_advice(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot._handle_text_command("/active")
+    assert any("No active advices." in text for text in bot.notifier.sent_texts)
+
+
+def test_active_command_with_open_advices(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot.runtime.storage.list_active_advices = lambda now=None: [
+        SimpleNamespace(
+            advice_id="A-BTC-1H-20260420153012-AAA111",
+            symbol="BTCUSDT",
+            side="LONG",
+            entry_trigger=62000.0,
+            remaining_minutes=35,
+        )
+    ]
+    bot._handle_text_command("/active")
+    payload = "\n".join(bot.notifier.sent_texts)
+    assert "Active advices (1)" in payload
+    assert "BTCUSDT LONG" in payload
+    assert "AAA111" in payload
+
+
+def test_positions_command_with_no_open_positions(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot.runtime.position_manager = SimpleNamespace(lots=[])
+    bot._handle_text_command("/positions")
+    assert any("No open positions." in text for text in bot.notifier.sent_texts)
+
+
+def test_viewer_cannot_use_admin_command(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot._handle_text_command("/pause", chat_id="100", user_id="200", role="viewer")
+    assert any("Permission denied" in text for text in bot.notifier.sent_texts)
+
+
+def test_closeall_requires_confirm_then_executes(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot.runtime.position_manager = SimpleNamespace(lots=[], close_all=lambda: [])
+    bot._handle_text_command("/closeall", chat_id="100", user_id="200", role="admin")
+    key = "100:200"
+    assert key in bot.pending_confirms
+    code = bot.pending_confirms[key].code
+    bot._handle_text_command(f"/confirm {code}", chat_id="100", user_id="200", role="admin")
+    assert bot.runtime.mode == SystemMode.PAUSED

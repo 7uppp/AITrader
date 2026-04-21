@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import tomllib
@@ -89,6 +89,10 @@ class RuntimeConfig:
     advisory_only: bool
     telegram_offset_path: str
     advisory_cooldown_minutes: int = 10
+    assumed_equity_usd: float = 10_000.0
+    auto_trade_enabled: bool = False
+    max_candidates_per_cycle: int = 3
+    execution_cooldown_seconds: int = 600
 
 
 @dataclass(slots=True)
@@ -98,11 +102,30 @@ class BinanceConfig:
 
 
 @dataclass(slots=True)
+class ExchangeConfig:
+    kind: str = "hyperliquid"
+
+
+@dataclass(slots=True)
+class HyperliquidConfig:
+    api_url: str
+    ws_url: str
+    vault_address: str
+    private_key: str
+    request_timeout_seconds: float
+
+
+@dataclass(slots=True)
 class TelegramConfig:
-    enabled: bool
-    bot_token: str
-    chat_id: str
-    send_rejections: bool
+    enabled: bool = False
+    bot_token: str = ""
+    chat_id: str = ""
+    send_rejections: bool = False
+    allowed_chat_ids: list[str] = field(default_factory=list)
+    admin_user_ids: list[str] = field(default_factory=list)
+    trader_user_ids: list[str] = field(default_factory=list)
+    viewer_user_ids: list[str] = field(default_factory=list)
+    confirm_ttl_seconds: int = 45
 
 
 @dataclass(slots=True)
@@ -113,8 +136,20 @@ class AppConfig:
     risk: RiskConfig
     telemetry: TelemetryConfig
     runtime: RuntimeConfig
-    binance: BinanceConfig
-    telegram: TelegramConfig
+    exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
+    binance: BinanceConfig = field(default_factory=lambda: BinanceConfig(base_url="https://fapi.binance.com", request_timeout_seconds=8.0))
+    hyperliquid: HyperliquidConfig = field(
+        default_factory=lambda: HyperliquidConfig(
+            api_url="https://api.hyperliquid.xyz",
+            ws_url="wss://api.hyperliquid.xyz/ws",
+            vault_address="",
+            private_key="",
+            request_timeout_seconds=8.0,
+        )
+    )
+    telegram: TelegramConfig = field(
+        default_factory=lambda: TelegramConfig(enabled=False, bot_token="", chat_id="", send_rejections=False)
+    )
 
     @classmethod
     def load(cls, path: str | Path) -> "AppConfig":
@@ -137,25 +172,76 @@ class AppConfig:
                 "advisory_only": True,
                 "telegram_offset_path": "data/telegram_offset.txt",
                 "advisory_cooldown_minutes": 10,
+                "assumed_equity_usd": 10_000.0,
+                "auto_trade_enabled": False,
+                "max_candidates_per_cycle": 3,
+                "execution_cooldown_seconds": 600,
             },
         )
         runtime = RuntimeConfig(**runtime_data)
+        exchange_data = data.get("exchange", {"kind": "hyperliquid"})
+        exchange = ExchangeConfig(**exchange_data)
         binance_data = data.get(
             "binance",
             {"base_url": "https://fapi.binance.com", "request_timeout_seconds": 8.0},
         )
         binance = BinanceConfig(**binance_data)
+        hyperliquid_data = data.get(
+            "hyperliquid",
+            {
+                "api_url": "https://api.hyperliquid.xyz",
+                "ws_url": "wss://api.hyperliquid.xyz/ws",
+                "vault_address": "",
+                "private_key": "",
+                "request_timeout_seconds": 8.0,
+            },
+        )
+        env_hl_private_key = os.getenv("AITRADER_HL_PRIVATE_KEY", "").strip()
+        env_hl_vault = os.getenv("AITRADER_HL_VAULT_ADDRESS", "").strip()
+        if env_hl_private_key:
+            hyperliquid_data["private_key"] = env_hl_private_key
+        if env_hl_vault:
+            hyperliquid_data["vault_address"] = env_hl_vault
+        hyperliquid = HyperliquidConfig(**hyperliquid_data)
         telegram_data = data.get(
             "telegram",
-            {"enabled": False, "bot_token": "", "chat_id": "", "send_rejections": False},
+            {
+                "enabled": False,
+                "bot_token": "",
+                "chat_id": "",
+                "send_rejections": False,
+                "allowed_chat_ids": [],
+                "admin_user_ids": [],
+                "trader_user_ids": [],
+                "viewer_user_ids": [],
+                "confirm_ttl_seconds": 45,
+            },
         )
         # Security-first override: prefer environment variables for secrets.
         env_bot_token = os.getenv("AITRADER_TELEGRAM_BOT_TOKEN", "").strip()
         env_chat_id = os.getenv("AITRADER_TELEGRAM_CHAT_ID", "").strip()
+        env_allowed_chat_ids = os.getenv("AITRADER_TELEGRAM_ALLOWED_CHAT_IDS", "").strip()
+        env_admin_user_ids = os.getenv("AITRADER_TELEGRAM_ADMIN_USER_IDS", "").strip()
+        env_trader_user_ids = os.getenv("AITRADER_TELEGRAM_TRADER_USER_IDS", "").strip()
+        env_viewer_user_ids = os.getenv("AITRADER_TELEGRAM_VIEWER_USER_IDS", "").strip()
         if env_bot_token:
             telegram_data["bot_token"] = env_bot_token
         if env_chat_id:
             telegram_data["chat_id"] = env_chat_id
+        if env_allowed_chat_ids:
+            telegram_data["allowed_chat_ids"] = _split_csv(env_allowed_chat_ids)
+        if env_admin_user_ids:
+            telegram_data["admin_user_ids"] = _split_csv(env_admin_user_ids)
+        if env_trader_user_ids:
+            telegram_data["trader_user_ids"] = _split_csv(env_trader_user_ids)
+        if env_viewer_user_ids:
+            telegram_data["viewer_user_ids"] = _split_csv(env_viewer_user_ids)
+
+        telegram_data["chat_id"] = str(telegram_data.get("chat_id", "")).strip()
+        telegram_data["allowed_chat_ids"] = [str(v).strip() for v in telegram_data.get("allowed_chat_ids", []) if str(v).strip()]
+        telegram_data["admin_user_ids"] = [str(v).strip() for v in telegram_data.get("admin_user_ids", []) if str(v).strip()]
+        telegram_data["trader_user_ids"] = [str(v).strip() for v in telegram_data.get("trader_user_ids", []) if str(v).strip()]
+        telegram_data["viewer_user_ids"] = [str(v).strip() for v in telegram_data.get("viewer_user_ids", []) if str(v).strip()]
         telegram = TelegramConfig(**telegram_data)
         return cls(
             system=system,
@@ -164,6 +250,12 @@ class AppConfig:
             risk=risk,
             telemetry=telemetry,
             runtime=runtime,
+            exchange=exchange,
             binance=binance,
+            hyperliquid=hyperliquid,
             telegram=telegram,
         )
+
+
+def _split_csv(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]

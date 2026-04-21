@@ -4,6 +4,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import UTC, date, datetime, timedelta
 from dataclasses import dataclass
 from enum import Enum
+from math import ceil
 from pathlib import Path
 import json
 import sqlite3
@@ -127,6 +128,18 @@ DDL_STATEMENTS = [
     )
     """,
 ]
+
+
+@dataclass(slots=True)
+class ActiveAdvice:
+    advice_id: str
+    symbol: str
+    side: str
+    entry_trigger: float | None
+    valid_minutes: int
+    ts: datetime
+    expires_at: datetime
+    remaining_minutes: int
 
 
 @dataclass(slots=True)
@@ -358,6 +371,80 @@ class Storage:
             ).fetchone()
         return row is not None
 
+    def get_active_advice(self, symbol: str, side: str, now: datetime | None = None) -> ActiveAdvice | None:
+        active = self.list_active_advices(symbol=symbol, side=side, now=now)
+        return active[0] if active else None
+
+    def get_latest_active_advice(self, now: datetime | None = None) -> ActiveAdvice | None:
+        active = self.list_active_advices(now=now)
+        return active[0] if active else None
+
+    def get_advice_ids_by_suffix(self, suffix: str, status: str | None = None, limit: int = 20) -> list[str]:
+        token = suffix.strip().upper()
+        if not token:
+            return []
+        where_sql = "UPPER(advice_id) LIKE ?"
+        params: list[object] = [f"%-{token}"]
+        if status is not None:
+            where_sql += " AND status = ?"
+            params.append(status.upper())
+        params.append(max(1, int(limit)))
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT advice_id
+                FROM advice_registry
+                WHERE {where_sql}
+                ORDER BY ts DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [str(row["advice_id"]) for row in rows]
+
+    def list_active_advices(
+        self,
+        symbol: str | None = None,
+        side: str | None = None,
+        now: datetime | None = None,
+    ) -> list[ActiveAdvice]:
+        current = self._as_utc(now or datetime.now(UTC))
+        where_clauses = ["status = 'OPEN'"]
+        params: list[object] = []
+        if symbol:
+            where_clauses.append("symbol = ?")
+            params.append(symbol.upper())
+        if side:
+            where_clauses.append("side = ?")
+            params.append(side.upper())
+        where_sql = " AND ".join(where_clauses)
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT advice_id, symbol, side, timeframe_mode, status, ts, payload_json
+                FROM advice_registry
+                WHERE {where_sql}
+                ORDER BY ts DESC
+                """,
+                params,
+            ).fetchall()
+
+        expired_ids: list[str] = []
+        active: list[ActiveAdvice] = []
+        for row in rows:
+            item, is_expired = self._to_active_advice(row, current)
+            if is_expired:
+                expired_ids.append(str(row["advice_id"]))
+                continue
+            if item is not None:
+                active.append(item)
+
+        if expired_ids:
+            for advice_id in expired_ids:
+                self.close_advice_record(advice_id=advice_id, closed_ts=current)
+        return active
+
     def recent_advice_exists(self, symbol: str, side: str, within_minutes: int) -> bool:
         if within_minutes <= 0:
             return False
@@ -369,6 +456,7 @@ class Storage:
                 FROM advice_registry
                 WHERE symbol = ?
                   AND side = ?
+                  AND status = 'OPEN'
                   AND ts >= ?
                 LIMIT 1
                 """,
@@ -412,3 +500,73 @@ class Storage:
         if column in existing:
             return
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
+    @staticmethod
+    def _parse_float(value: object) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _default_valid_minutes(timeframe_mode: str) -> int:
+        if timeframe_mode in {"1h", "1h_primary"}:
+            return 90
+        if timeframe_mode == "15m":
+            return 20
+        return 45
+
+    def _to_active_advice(self, row: sqlite3.Row, now: datetime) -> tuple[ActiveAdvice | None, bool]:
+        if str(row["status"]).upper() != "OPEN":
+            return (None, False)
+        try:
+            ts = self._as_utc(datetime.fromisoformat(str(row["ts"])))
+        except ValueError:
+            return (None, True)
+
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        advisory = payload.get("advisory") if isinstance(payload, dict) else {}
+        if not isinstance(advisory, dict):
+            advisory = {}
+
+        timeframe_mode = str(row["timeframe_mode"] or advisory.get("timeframe_mode") or "")
+        valid_minutes_raw = advisory.get("valid_minutes")
+        valid_minutes = 0
+        try:
+            valid_minutes = int(valid_minutes_raw) if valid_minutes_raw is not None else 0
+        except (TypeError, ValueError):
+            valid_minutes = 0
+        if valid_minutes <= 0:
+            valid_minutes = self._default_valid_minutes(timeframe_mode)
+
+        expires_at = ts + timedelta(minutes=valid_minutes)
+        if now >= expires_at:
+            return (None, True)
+
+        remaining_seconds = (expires_at - now).total_seconds()
+        remaining_minutes = max(1, int(ceil(remaining_seconds / 60.0)))
+        entry_trigger = self._parse_float(advisory.get("entry_trigger"))
+        return (
+            ActiveAdvice(
+                advice_id=str(row["advice_id"]),
+                symbol=str(row["symbol"]),
+                side=str(row["side"]),
+                entry_trigger=entry_trigger,
+                valid_minutes=valid_minutes,
+                ts=ts,
+                expires_at=expires_at,
+                remaining_minutes=remaining_minutes,
+            ),
+            False,
+        )

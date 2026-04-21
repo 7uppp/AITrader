@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 import re
+import secrets
+import string
 
 from .runtime import TradingRuntime
 from .telegram_notify import TelegramNotifier
 from .time_utils import utc_now
+from .types import SystemMode
 
 SUPPORTED_TIMEFRAMES = {"15m", "1h", "hybrid", "1h_primary", "auto"}
 COMPACT_SYMBOLS = {
@@ -18,6 +22,26 @@ COMPACT_SYMBOLS = {
 }
 COMPACT_PATTERN = re.compile(r"^(btc|eth|bnb|dot|sol)(15m|1h|hybrid|auto)?$")
 
+VIEWER_COMMANDS = {
+    "/scan",
+    "/active",
+    "/alive",
+    "/ping",
+    "/status",
+    "/help",
+    "/positions",
+}
+TRADER_COMMANDS = VIEWER_COMMANDS | {"/result", "/win", "/loss"}
+ADMIN_COMMANDS = TRADER_COMMANDS | {"/pause", "/resume", "/riskoff", "/closeall", "/killswitch", "/confirm"}
+DANGEROUS_COMMANDS = {"/closeall", "/killswitch"}
+
+
+@dataclass(slots=True)
+class PendingConfirm:
+    action: str
+    code: str
+    expires_at: datetime
+
 
 @dataclass(slots=True)
 class TelegramCommandBot:
@@ -25,6 +49,7 @@ class TelegramCommandBot:
     notifier: TelegramNotifier
     offset_path: Path
     menu_sync_attempted: bool = False
+    pending_confirms: dict[str, PendingConfirm] = field(default_factory=dict)
 
     @classmethod
     def from_runtime(cls, runtime: TradingRuntime) -> "TelegramCommandBot":
@@ -51,33 +76,80 @@ class TelegramCommandBot:
             if not isinstance(message, dict):
                 continue
             chat = message.get("chat", {})
-            chat_id = str(chat.get("id", ""))
-            if self.notifier.config.chat_id and chat_id != str(self.notifier.config.chat_id):
-                continue
+            chat_id = str(chat.get("id", "")).strip()
+            user = message.get("from", {})
+            user_id = str(user.get("id", "")).strip()
             text = str(message.get("text", "")).strip()
             if not text:
                 continue
-            self._handle_text_command(text)
+
+            if not self._is_allowed_chat(chat_id):
+                continue
+            role = self._resolve_role(user_id)
+            if role is None:
+                self._reply(chat_id, "You are not authorized to use this bot.")
+                self.runtime.storage.insert_system_event(
+                    utc_now(),
+                    "telegram_user_unauthorized",
+                    {"chat_id": chat_id, "user_id": user_id, "text": text},
+                )
+                continue
+
+            self._handle_text_command(text, chat_id=chat_id, user_id=user_id, role=role)
             handled += 1
 
         self._save_offset(max_update_id)
         return f"handled:{handled}"
 
-    def _handle_text_command(self, text: str) -> None:
+    def _handle_text_command(self, text: str, chat_id: str = "", user_id: str = "", role: str = "admin") -> None:
         normalized = text.strip()
         lower = normalized.lower()
+        command_key = self._command_key(lower)
+        if not self._role_allows(role, command_key):
+            self._reply(chat_id, f"Permission denied for role={role}.")
+            self.runtime.storage.insert_system_event(
+                utc_now(),
+                "telegram_permission_denied",
+                {"chat_id": chat_id, "user_id": user_id, "role": role, "text": text},
+            )
+            return
+
+        if lower.startswith("/confirm"):
+            self._handle_confirm_command(normalized, chat_id=chat_id, user_id=user_id)
+            return
+
+        if command_key in DANGEROUS_COMMANDS:
+            self._request_danger_confirm(action=command_key, chat_id=chat_id, user_id=user_id)
+            return
+
+        if lower.startswith("/pause"):
+            self._set_mode(SystemMode.PAUSED, chat_id=chat_id, event="telegram_pause_command")
+            return
+        if lower.startswith("/resume"):
+            if self.runtime.mode == SystemMode.KILLED:
+                self._reply(chat_id, "Cannot /resume from KILLED. Use manual reset.")
+                return
+            self._set_mode(SystemMode.RUNNING, chat_id=chat_id, event="telegram_resume_command")
+            return
+        if lower.startswith("/riskoff"):
+            if self.runtime.mode == SystemMode.KILLED:
+                self._reply(chat_id, "Cannot switch mode from KILLED.")
+                return
+            self._set_mode(SystemMode.RISK_OFF, chat_id=chat_id, event="telegram_riskoff_command")
+            return
 
         if lower.startswith("/scan") or self._looks_like_compact_scan(lower):
             symbols, timeframe, manual_total_usdt, errors = self._parse_symbols_and_timeframe(normalized)
             if errors:
-                ok, reason = self.notifier.send_text(
-                    "命令格式不正确。\n"
-                    "示例: /scan, btc15m, bnb1h, dotauto, /scan BTCUSDT 500, sol15m 500"
+                ok, reason = self._reply(
+                    chat_id,
+                    "Invalid command format.\n"
+                    "Examples: /scan, btc15m, bnb1h, dotauto, /scan BTCUSDT 500, sol15m 500",
                 )
                 self.runtime.storage.insert_system_event(
                     utc_now(),
                     "telegram_scan_parse_error",
-                    {"text": text, "errors": errors, "sent": ok, "reason": reason},
+                    {"text": text, "errors": errors, "sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id},
                 )
                 return
 
@@ -88,60 +160,122 @@ class TelegramCommandBot:
                 manual_total_usdt=manual_total_usdt,
             )
             payload = "\n\n".join(a.message for a in analyses)
-            ok, reason = self.notifier.send_text(payload[:3800])
+            ok, reason = self._reply(chat_id, payload[:3800])
             self.runtime.storage.insert_system_event(
                 utc_now(),
                 "telegram_scan_command",
-                {"symbols": symbols, "timeframe": timeframe, "manual_total_usdt": manual_total_usdt, "sent": ok, "reason": reason},
+                {
+                    "symbols": symbols,
+                    "timeframe": timeframe,
+                    "manual_total_usdt": manual_total_usdt,
+                    "sent": ok,
+                    "reason": reason,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "role": role,
+                },
             )
             return
 
         if lower.startswith("/result") or lower.startswith("/win") or lower.startswith("/loss"):
-            self._handle_result_command(normalized)
+            self._handle_result_command(normalized, chat_id=chat_id, user_id=user_id, role=role)
+            return
+
+        if lower.startswith("/active"):
+            now = utc_now()
+            active_items = self.runtime.storage.list_active_advices(now=now)
+            if not active_items:
+                msg = "No active advices."
+            else:
+                lines = [f"Active advices ({len(active_items)}):"]
+                for item in active_items:
+                    side_name = "LONG" if str(item.side).upper() == "LONG" else "SHORT"
+                    entry_text = f"{item.entry_trigger:.4f}" if item.entry_trigger is not None else "-"
+                    short_id = str(item.advice_id).split("-")[-1]
+                    lines.append(
+                        f"{item.symbol} {side_name} | id={item.advice_id} | short={short_id} | entry {entry_text} | remaining ~{item.remaining_minutes}m"
+                    )
+                msg = "\n".join(lines)
+            ok, reason = self._reply(chat_id, msg)
+            self.runtime.storage.insert_system_event(
+                utc_now(),
+                "telegram_active_command",
+                {"sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id, "role": role},
+            )
             return
 
         if lower.startswith("/alive") or lower.startswith("/ping"):
             msg = (
                 "bot alive\n"
-                f"时间: {utc_now().isoformat(timespec='seconds')} UTC\n"
-                f"系统模式: {self.runtime.mode.value}\n"
-                f"白名单: {', '.join(self.runtime.config.trading.symbols)}"
+                f"time: {utc_now().isoformat(timespec='seconds')} UTC\n"
+                f"mode: {self.runtime.mode.value}\n"
+                f"watchlist: {', '.join(self.runtime.config.trading.symbols)}"
             )
-            ok, reason = self.notifier.send_text(msg)
-            self.runtime.storage.insert_system_event(utc_now(), "telegram_alive_command", {"sent": ok, "reason": reason})
+            ok, reason = self._reply(chat_id, msg)
+            self.runtime.storage.insert_system_event(
+                utc_now(),
+                "telegram_alive_command",
+                {"sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id, "role": role},
+            )
             return
 
         if lower.startswith("/status"):
             msg = (
-                f"系统模式: {self.runtime.mode.value}\n"
-                f"分析白名单: {', '.join(self.runtime.config.trading.symbols)}\n"
-                "存活检查: /alive\n"
-                "建议回报(推荐): /result <AdviceID> win 1.2\n"
-                "快速回报: /win BTCUSDT 0.8 或 /loss ETHUSDT -0.6"
+                f"mode: {self.runtime.mode.value}\n"
+                f"exchange: {self.runtime.config.exchange.kind}\n"
+                f"auto_trade: {self.runtime.config.runtime.auto_trade_enabled and not self.runtime.config.runtime.advisory_only}\n"
+                f"watchlist: {', '.join(self.runtime.config.trading.symbols)}\n"
+                "positions: /positions\n"
+                "active advices: /active\n"
+                "alive check: /alive\n"
+                "result report: /result <short_id|full_id|last> win 1.2\n"
+                "quick report: /win BTCUSDT 0.8 or /loss ETHUSDT -0.6"
             )
-            ok, reason = self.notifier.send_text(msg)
-            self.runtime.storage.insert_system_event(utc_now(), "telegram_status_command", {"sent": ok, "reason": reason})
+            ok, reason = self._reply(chat_id, msg)
+            self.runtime.storage.insert_system_event(
+                utc_now(),
+                "telegram_status_command",
+                {"sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id, "role": role},
+            )
+            return
+
+        if lower.startswith("/positions"):
+            self._handle_positions_command(chat_id=chat_id, user_id=user_id, role=role)
             return
 
         if lower.startswith("/help"):
             help_text = (
-                "可用命令:\n"
-                "/scan -> 默认扫描白名单(BTC/ETH/BNB/DOT/SOL)，默认auto\n"
-                "/scan BTCUSDT 1h -> 指定币和周期\n"
-                "btc15m / eth1h / bnb15m / dot1h / solauto -> 短命令\n"
-                "/scan BTCUSDT 500 -> 输入总预算USDT，回传主副仓数量\n"
-                "/alive -> 检查机器人是否存活\n"
-                "/status -> 查看系统状态\n"
-                "/result <AdviceID> win 1.2 -> 按建议ID回报(推荐)\n"
-                "/win SOLUSDT 0.8 -> 仅按币种快速记录盈利\n"
-                "/loss ETHUSDT -0.6 -> 仅按币种快速记录亏损"
+                "commands:\n"
+                "/scan -> scan watchlist with default auto mode\n"
+                "/scan BTCUSDT 1h -> scan one symbol with timeframe\n"
+                "btc15m / eth1h / bnb15m / dot1h / solauto -> compact scan command\n"
+                "/scan BTCUSDT 500 -> include total USDT budget for split sizing\n"
+                "/positions -> show current open position lots\n"
+                "/active -> show active unclosed advices\n"
+                "/alive -> bot health check\n"
+                "/status -> runtime status summary\n"
+                "/result ABC123 win 1.2 -> report by short id\n"
+                "/result last win 1.2 -> report latest active advice\n"
+                "/result A-BTC-... win 1.2 -> report by full advice id\n"
+                "/win SOLUSDT 0.8 -> quick win report\n"
+                "/loss ETHUSDT -0.6 -> quick loss report\n"
+                "/pause /resume /riskoff -> admin mode controls\n"
+                "/closeall /killswitch -> admin only with /confirm CODE"
             )
-            ok, reason = self.notifier.send_text(help_text)
-            self.runtime.storage.insert_system_event(utc_now(), "telegram_help_command", {"sent": ok, "reason": reason})
+            ok, reason = self._reply(chat_id, help_text)
+            self.runtime.storage.insert_system_event(
+                utc_now(),
+                "telegram_help_command",
+                {"sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id, "role": role},
+            )
             return
 
-        ok, reason = self.notifier.send_text("未识别命令。用 /help 查看可用指令。")
-        self.runtime.storage.insert_system_event(utc_now(), "telegram_unknown_command", {"text": text, "sent": ok, "reason": reason})
+        ok, reason = self._reply(chat_id, "Unknown command. Use /help for command list.")
+        self.runtime.storage.insert_system_event(
+            utc_now(),
+            "telegram_unknown_command",
+            {"text": text, "sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id, "role": role},
+        )
 
     def ensure_menu_commands(self) -> tuple[bool, str]:
         if self.menu_sync_attempted:
@@ -160,12 +294,17 @@ class TelegramCommandBot:
     def _menu_commands() -> list[dict[str, str]]:
         return [
             {"command": "scan", "description": "Scan symbols and show setup"},
+            {"command": "positions", "description": "Show open positions"},
+            {"command": "active", "description": "Show active advices"},
             {"command": "alive", "description": "Check bot is alive"},
             {"command": "status", "description": "Show system status"},
             {"command": "help", "description": "Show command help"},
             {"command": "result", "description": "Report advice result by ID"},
-            {"command": "win", "description": "Quick win report by symbol"},
-            {"command": "loss", "description": "Quick loss report by symbol"},
+            {"command": "pause", "description": "Pause new entries (admin)"},
+            {"command": "resume", "description": "Resume running (admin)"},
+            {"command": "riskoff", "description": "Risk-off mode (admin)"},
+            {"command": "closeall", "description": "Close all positions (admin)"},
+            {"command": "killswitch", "description": "Kill switch (admin)"},
         ]
 
     def _looks_like_compact_scan(self, lower_text: str) -> bool:
@@ -236,18 +375,55 @@ class TelegramCommandBot:
 
         return (unique_symbols, timeframe, manual_total_usdt, errors)
 
-    def _handle_result_command(self, text: str) -> None:
+    def _handle_positions_command(self, chat_id: str, user_id: str, role: str) -> None:
+        pm = getattr(self.runtime, "position_manager", None)
+        if pm is None or not hasattr(pm, "lots"):
+            ok, reason = self._reply(chat_id, "Position manager unavailable in current runtime.")
+            self.runtime.storage.insert_system_event(
+                utc_now(),
+                "telegram_positions_unavailable",
+                {"sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id, "role": role},
+            )
+            return
+
+        active = [lot for lot in pm.lots if getattr(lot, "active", False)]
+        if not active:
+            ok, reason = self._reply(chat_id, "No open positions.")
+            self.runtime.storage.insert_system_event(
+                utc_now(),
+                "telegram_positions_command",
+                {"open_positions": 0, "sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id, "role": role},
+            )
+            return
+
+        lines = [f"Open positions ({len(active)} lots):"]
+        for lot in active:
+            tp = f"{lot.take_profit:.6f}" if lot.take_profit is not None else "-"
+            lines.append(
+                f"{lot.symbol} {lot.side.value} {lot.kind.value} | qty={lot.quantity:.6f} "
+                f"entry={lot.avg_entry:.6f} stop={lot.current_stop:.6f} tp={tp} "
+                f"trail={lot.trailing_armed} be={lot.breakeven_armed}"
+            )
+        ok, reason = self._reply(chat_id, "\n".join(lines))
+        self.runtime.storage.insert_system_event(
+            utc_now(),
+            "telegram_positions_command",
+            {"open_positions": len(active), "sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id, "role": role},
+        )
+
+    def _handle_result_command(self, text: str, chat_id: str, user_id: str, role: str) -> None:
         parsed, error = self._parse_result_command(text)
         if error is not None or parsed is None:
-            ok, reason = self.notifier.send_text(
-                "结果命令格式不正确。\n"
-                "推荐: /result A-BTC-1H-20260420153012-ABC123 win 1.2\n"
-                "快速: /win BTCUSDT 0.9 或 /loss ETHUSDT -0.7"
+            ok, reason = self._reply(
+                chat_id,
+                "Invalid result command.\n"
+                "Try: /result ABC123 win 1.2 or /result last win 1.2\n"
+                "Quick: /win BTCUSDT 0.9 or /loss ETHUSDT -0.7",
             )
             self.runtime.storage.insert_system_event(
                 utc_now(),
                 "telegram_result_parse_error",
-                {"text": text, "error": error or "invalid_result_command", "sent": ok, "reason": reason},
+                {"text": text, "error": error or "invalid_result_command", "sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id, "role": role},
             )
             return
 
@@ -255,23 +431,33 @@ class TelegramCommandBot:
         now = utc_now()
 
         if advice_id is not None:
-            advice = self.runtime.storage.get_advice_record(advice_id)
+            resolved_advice_id, resolve_error = self._resolve_advice_target(advice_id, now=now)
+            if resolve_error is not None or resolved_advice_id is None:
+                ok, reason = self._reply(chat_id, resolve_error or "Advice lookup failed")
+                self.runtime.storage.insert_system_event(
+                    now,
+                    "telegram_result_advice_resolve_error",
+                    {"target": advice_id, "error": resolve_error or "resolve_failed", "sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id, "role": role},
+                )
+                return
+            advice = self.runtime.storage.get_advice_record(resolved_advice_id)
             if advice is None:
-                ok, reason = self.notifier.send_text(f"AdviceID不存在: {advice_id}")
+                ok, reason = self._reply(chat_id, f"AdviceID not found: {resolved_advice_id}")
                 self.runtime.storage.insert_system_event(
                     now,
                     "telegram_result_advice_not_found",
-                    {"advice_id": advice_id, "sent": ok, "reason": reason},
+                    {"advice_id": resolved_advice_id, "sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id, "role": role},
                 )
                 return
-            if self.runtime.storage.has_feedback_for_advice(advice_id):
-                ok, reason = self.notifier.send_text(f"该AdviceID已回报过: {advice_id}")
+            if self.runtime.storage.has_feedback_for_advice(resolved_advice_id):
+                ok, reason = self._reply(chat_id, f"Already reported: {resolved_advice_id}")
                 self.runtime.storage.insert_system_event(
                     now,
                     "telegram_result_duplicate_advice",
-                    {"advice_id": advice_id, "sent": ok, "reason": reason},
+                    {"advice_id": resolved_advice_id, "sent": ok, "reason": reason, "chat_id": chat_id, "user_id": user_id, "role": role},
                 )
                 return
+            advice_id = resolved_advice_id
             symbol = str(advice["symbol"])
 
         assert symbol is not None
@@ -282,7 +468,7 @@ class TelegramCommandBot:
             outcome=outcome,
             pnl_pct=pnl_pct,
             note=note,
-            payload={"source": "telegram", "raw_text": text},
+            payload={"source": "telegram", "raw_text": text, "chat_id": chat_id, "user_id": user_id, "role": role},
         )
         if advice_id is not None:
             self.runtime.storage.close_advice_record(advice_id=advice_id, closed_ts=now)
@@ -290,19 +476,19 @@ class TelegramCommandBot:
         self.runtime.storage.insert_operator_command(
             ts=now,
             command="trade_result",
-            payload={"advice_id": advice_id, "symbol": symbol, "outcome": outcome, "pnl_pct": pnl_pct, "note": note},
+            payload={"advice_id": advice_id, "symbol": symbol, "outcome": outcome, "pnl_pct": pnl_pct, "note": note, "chat_id": chat_id, "user_id": user_id, "role": role},
         )
 
         stats_all = self.runtime.storage.trade_feedback_stats()
         stats_symbol = self.runtime.storage.trade_feedback_stats(symbol=symbol)
-        pnl_part = f"{pnl_pct:.2f}%" if pnl_pct is not None else "未填写"
+        pnl_part = f"{pnl_pct:.2f}%" if pnl_pct is not None else "N/A"
         advice_part = f"\nAdviceID: {advice_id}" if advice_id is not None else ""
         msg = (
-            f"已记录: {symbol} {outcome}，本笔PnL={pnl_part}{advice_part}\n"
-            f"{symbol}统计: {stats_symbol['wins']}/{stats_symbol['total']} 胜，胜率{stats_symbol['win_rate_pct']:.1f}%\n"
-            f"全局统计: {stats_all['wins']}/{stats_all['total']} 胜，胜率{stats_all['win_rate_pct']:.1f}%"
+            f"Recorded: {symbol} {outcome}, PnL={pnl_part}{advice_part}\n"
+            f"{symbol} stats: {stats_symbol['wins']}/{stats_symbol['total']} wins, win rate {stats_symbol['win_rate_pct']:.1f}%\n"
+            f"Global stats: {stats_all['wins']}/{stats_all['total']} wins, win rate {stats_all['win_rate_pct']:.1f}%"
         )
-        ok, reason = self.notifier.send_text(msg)
+        ok, reason = self._reply(chat_id, msg)
         self.runtime.storage.insert_system_event(
             now,
             "telegram_result_recorded",
@@ -314,8 +500,115 @@ class TelegramCommandBot:
                 "note": note,
                 "sent": ok,
                 "reason": reason,
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "role": role,
             },
         )
+
+    def _request_danger_confirm(self, action: str, chat_id: str, user_id: str) -> None:
+        code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+        expires_at = utc_now() + timedelta(seconds=max(15, self._confirm_ttl_seconds()))
+        self.pending_confirms[self._confirm_key(chat_id, user_id)] = PendingConfirm(action=action, code=code, expires_at=expires_at)
+        self._reply(chat_id, f"Confirm required for {action}. Send /confirm {code} within {self._confirm_ttl_seconds()}s.")
+        self.runtime.storage.insert_system_event(
+            utc_now(),
+            "telegram_danger_confirm_requested",
+            {"action": action, "chat_id": chat_id, "user_id": user_id, "expires_at": expires_at.isoformat()},
+        )
+
+    def _handle_confirm_command(self, text: str, chat_id: str, user_id: str) -> None:
+        parts = [p for p in text.strip().split(" ") if p]
+        if len(parts) < 2:
+            self._reply(chat_id, "Usage: /confirm CODE")
+            return
+        code = parts[1].strip().upper()
+        key = self._confirm_key(chat_id, user_id)
+        pending = self.pending_confirms.get(key)
+        if pending is None:
+            self._reply(chat_id, "No pending dangerous action.")
+            return
+        if utc_now() > pending.expires_at:
+            self.pending_confirms.pop(key, None)
+            self._reply(chat_id, "Confirmation expired. Re-run command.")
+            return
+        if code != pending.code:
+            self._reply(chat_id, "Invalid confirmation code.")
+            return
+        self.pending_confirms.pop(key, None)
+        self._execute_confirmed_action(action=pending.action, chat_id=chat_id, user_id=user_id)
+
+    def _execute_confirmed_action(self, action: str, chat_id: str, user_id: str) -> None:
+        if action == "/closeall":
+            self._close_all_positions()
+            if self.runtime.mode != SystemMode.KILLED:
+                self.runtime.mode = SystemMode.PAUSED
+            msg = "closeall executed. Mode set to PAUSED."
+            event = "telegram_closeall_executed"
+        elif action == "/killswitch":
+            self._close_all_positions()
+            self.runtime.mode = SystemMode.KILLED
+            msg = "killswitch executed. Mode set to KILLED."
+            event = "telegram_killswitch_executed"
+        else:
+            msg = f"Unknown confirmed action: {action}"
+            event = "telegram_confirm_unknown_action"
+        ok, reason = self._reply(chat_id, msg)
+        self.runtime.storage.insert_system_event(
+            utc_now(),
+            event,
+            {"action": action, "chat_id": chat_id, "user_id": user_id, "sent": ok, "reason": reason},
+        )
+
+    def _set_mode(self, mode: SystemMode, chat_id: str, event: str) -> None:
+        self.runtime.mode = mode
+        ok, reason = self._reply(chat_id, f"Mode -> {mode.value}")
+        self.runtime.storage.insert_system_event(utc_now(), event, {"mode": mode.value, "sent": ok, "reason": reason, "chat_id": chat_id})
+
+    def _close_all_positions(self) -> None:
+        pm = getattr(self.runtime, "position_manager", None)
+        if pm is not None and hasattr(pm, "close_all"):
+            try:
+                pm.close_all()
+            except Exception:
+                pass
+        engine = getattr(self.runtime, "execution_engine", None)
+        if engine is not None and hasattr(engine, "close_all"):
+            try:
+                engine.close_all(self.runtime.config.trading.symbols)
+            except Exception:
+                pass
+        self.runtime._refresh_account_for_symbol(symbol="")
+
+    def _resolve_advice_target(self, target: str, now: datetime) -> tuple[str | None, str | None]:
+        token = target.strip()
+        if not token:
+            return (None, "Advice target cannot be empty.")
+        if token.lower() == "last":
+            latest = self.runtime.storage.get_latest_active_advice(now=now)
+            if latest is None:
+                return (None, "No active advice found for token 'last'.")
+            return (latest.advice_id, None)
+
+        if token.upper().startswith("A-"):
+            return (token, None)
+
+        compact = token.upper()
+        if re.fullmatch(r"[A-Z0-9]{4,10}", compact):
+            open_hits = self.runtime.storage.get_advice_ids_by_suffix(compact, status="OPEN")
+            if len(open_hits) == 1:
+                return (open_hits[0], None)
+            if len(open_hits) > 1:
+                return (None, f"Short ID {compact} matches multiple OPEN advices. Please use full AdviceID.")
+
+            any_hits = self.runtime.storage.get_advice_ids_by_suffix(compact, status=None)
+            if len(any_hits) == 1:
+                return (any_hits[0], None)
+            if len(any_hits) > 1:
+                return (None, f"Short ID {compact} matches multiple historical advices. Please use full AdviceID.")
+            return (None, f"Short ID {compact} not found.")
+
+        return (token, None)
 
     def _parse_result_command(self, text: str) -> tuple[tuple[str | None, str | None, str, float | None, str] | None, str | None]:
         normalized = text.strip()
@@ -398,6 +691,61 @@ class TelegramCommandBot:
             return float(token)
         except ValueError:
             return None
+
+    def _role_allows(self, role: str, command_key: str) -> bool:
+        if role == "admin":
+            return command_key in ADMIN_COMMANDS or command_key == "/scan_compact"
+        if role == "trader":
+            return command_key in TRADER_COMMANDS or command_key == "/scan_compact"
+        return command_key in VIEWER_COMMANDS or command_key == "/scan_compact"
+
+    def _resolve_role(self, user_id: str) -> str | None:
+        cfg = self.notifier.config
+        admin_ids = set(cfg.admin_user_ids)
+        trader_ids = set(cfg.trader_user_ids)
+        viewer_ids = set(cfg.viewer_user_ids)
+        has_any_role_whitelist = bool(admin_ids or trader_ids or viewer_ids)
+
+        if user_id in admin_ids:
+            return "admin"
+        if user_id in trader_ids:
+            return "trader"
+        if user_id in viewer_ids:
+            return "viewer"
+        if has_any_role_whitelist:
+            return None
+        return "admin"
+
+    def _is_allowed_chat(self, chat_id: str) -> bool:
+        cfg = self.notifier.config
+        allowed = {item for item in cfg.allowed_chat_ids if item}
+        if cfg.chat_id:
+            allowed.add(cfg.chat_id)
+        if not allowed:
+            return True
+        return chat_id in allowed
+
+    @staticmethod
+    def _command_key(lower_text: str) -> str:
+        token = lower_text.split(" ")[0] if lower_text else ""
+        if token.startswith("/"):
+            return token
+        if COMPACT_PATTERN.match(token):
+            return "/scan_compact"
+        return token
+
+    def _reply(self, chat_id: str, text: str) -> tuple[bool, str]:
+        target_chat = chat_id or self.notifier.config.chat_id
+        if not target_chat:
+            return self.notifier.send_text(text)
+        return self.notifier.send_text_to_chat(target_chat, text)
+
+    def _confirm_ttl_seconds(self) -> int:
+        return max(15, int(self.notifier.config.confirm_ttl_seconds))
+
+    @staticmethod
+    def _confirm_key(chat_id: str, user_id: str) -> str:
+        return f"{chat_id}:{user_id}"
 
     def _load_offset(self) -> int | None:
         if not self.offset_path.exists():
