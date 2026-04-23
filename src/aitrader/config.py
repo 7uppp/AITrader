@@ -50,6 +50,12 @@ class StrategyConfig:
     trigger_volume_sma_period: int = 20
     trigger_volume_multiplier: float = 1.0
     signal_min_confidence: float = 0.58
+    time_stop_soft_minutes_1h: int = 90
+    time_stop_hard_minutes_1h: int = 120
+    time_stop_soft_minutes_15m: int = 45
+    time_stop_hard_minutes_15m: int = 60
+    stalled_progress_r_threshold: float = 0.5
+    stalled_atr_percentile_max: float = 0.35
 
 
 @dataclass(slots=True)
@@ -113,6 +119,7 @@ class HyperliquidConfig:
     vault_address: str
     private_key: str
     request_timeout_seconds: float
+    network: str = "testnet"
 
 
 @dataclass(slots=True)
@@ -140,11 +147,12 @@ class AppConfig:
     binance: BinanceConfig = field(default_factory=lambda: BinanceConfig(base_url="https://fapi.binance.com", request_timeout_seconds=8.0))
     hyperliquid: HyperliquidConfig = field(
         default_factory=lambda: HyperliquidConfig(
-            api_url="https://api.hyperliquid.xyz",
-            ws_url="wss://api.hyperliquid.xyz/ws",
+            api_url="https://api.hyperliquid-testnet.xyz",
+            ws_url="wss://api.hyperliquid-testnet.xyz/ws",
             vault_address="",
             private_key="",
             request_timeout_seconds=8.0,
+            network="testnet",
         )
     )
     telegram: TelegramConfig = field(
@@ -189,6 +197,7 @@ class AppConfig:
         hyperliquid_data = data.get(
             "hyperliquid",
             {
+                "network": "testnet",
                 "api_url": "https://api.hyperliquid.xyz",
                 "ws_url": "wss://api.hyperliquid.xyz/ws",
                 "vault_address": "",
@@ -196,12 +205,20 @@ class AppConfig:
                 "request_timeout_seconds": 8.0,
             },
         )
+        env_hl_network = os.getenv("AITRADER_HL_NETWORK", "").strip().lower()
         env_hl_private_key = os.getenv("AITRADER_HL_PRIVATE_KEY", "").strip()
         env_hl_vault = os.getenv("AITRADER_HL_VAULT_ADDRESS", "").strip()
+        if env_hl_network:
+            hyperliquid_data["network"] = env_hl_network
         if env_hl_private_key:
             hyperliquid_data["private_key"] = env_hl_private_key
         if env_hl_vault:
             hyperliquid_data["vault_address"] = env_hl_vault
+        network = str(hyperliquid_data.get("network", "testnet")).strip().lower()
+        if network not in {"testnet", "mainnet"}:
+            network = "testnet"
+        hyperliquid_data["network"] = network
+        hyperliquid_data["api_url"], hyperliquid_data["ws_url"] = resolve_hyperliquid_endpoints(network)
         hyperliquid = HyperliquidConfig(**hyperliquid_data)
         telegram_data = data.get(
             "telegram",
@@ -259,3 +276,10 @@ class AppConfig:
 
 def _split_csv(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def resolve_hyperliquid_endpoints(network: str) -> tuple[str, str]:
+    normalized = network.strip().lower()
+    if normalized == "mainnet":
+        return ("https://api.hyperliquid.xyz", "wss://api.hyperliquid.xyz/ws")
+    return ("https://api.hyperliquid-testnet.xyz", "wss://api.hyperliquid-testnet.xyz/ws")

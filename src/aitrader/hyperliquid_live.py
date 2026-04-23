@@ -29,6 +29,17 @@ class HyperliquidLiveAdapter:
     _account: Any = None
     _eth_account_module: ModuleType | None = None
 
+    def update_network(self, network: str) -> None:
+        normalized = network.strip().lower()
+        self.config.network = normalized
+        if normalized == "mainnet":
+            self.config.api_url = "https://api.hyperliquid.xyz"
+            self.config.ws_url = "wss://api.hyperliquid.xyz/ws"
+        else:
+            self.config.api_url = "https://api.hyperliquid-testnet.xyz"
+            self.config.ws_url = "wss://api.hyperliquid-testnet.xyz/ws"
+        self._reset_client_state()
+
     def submit_order(self, symbol: str, side: Side, quantity: float, price: float | None, reduce_only: bool) -> SubmittedOrder:
         created_at = utc_now()
         client_order_id = f"hl-{uuid4().hex[:16]}"
@@ -190,6 +201,10 @@ class HyperliquidLiveAdapter:
                 self._exchange = exchange_cls(account, self.config.api_url, account_address)
             else:
                 self._exchange = exchange_cls(account, self.config.api_url)
+
+    def _reset_client_state(self) -> None:
+        self._exchange = None
+        self._info = None
 
     def _load_sdk(self) -> None:
         if self._sdk_loaded:

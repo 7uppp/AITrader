@@ -11,7 +11,7 @@ from .advisory import TradeAdvisory, advisory_to_telegram_text, build_trade_advi
 from .audit import config_hash
 from .binance_market_data import BinanceMarketDataClient
 from .execution import ExecutionEngine, PaperExecutionAdapter
-from .config import AppConfig
+from .config import AppConfig, resolve_hyperliquid_endpoints
 from .hyperliquid_live import HyperliquidLiveAdapter
 from .hyperliquid_market_data import HyperliquidMarketDataClient
 from .market_data import MarketDataPolicy, MarketDataValidator
@@ -179,6 +179,7 @@ class TradingRuntime:
     def run_cycle(self) -> RuntimeResult:
         if self.config.runtime.auto_trade_enabled and not self.config.runtime.advisory_only:
             return self._run_auto_trade_cycle()
+        self._monitor_open_positions()
         analyses = self.analyze_symbols(self.config.trading.symbols, push_to_telegram=True, timeframe_mode="auto")
         result = RuntimeResult(processed_symbols=len(analyses))
         for analysis in analyses:
@@ -225,6 +226,7 @@ class TradingRuntime:
         return outputs
 
     def _run_auto_trade_cycle(self) -> RuntimeResult:
+        self._monitor_open_positions()
         analyses = self.analyze_symbols(self.config.trading.symbols, push_to_telegram=False, timeframe_mode="auto")
         result = RuntimeResult(processed_symbols=len(analyses))
         candidates = self._collect_auto_candidates(analyses)
@@ -380,7 +382,15 @@ class TradingRuntime:
                 confidence=candidate.advisory.confidence,
                 reason_codes=[f"advice_id:{candidate.advice_id}"],
             )
-            self.position_manager.open_split_position(signal=signal, quantity=total_qty)
+            lots = self.position_manager.open_split_position(
+                signal=signal,
+                quantity=total_qty,
+                opened_at=utc_now(),
+                entry_timeframe=candidate.advisory.timeframe_mode,
+                last_signal_state=f"{candidate.advisory.timeframe_mode}:{candidate.advisory.trigger_source}",
+            )
+            for lot in lots:
+                self.storage.insert_position_lot(utc_now(), lot.symbol, lot.kind.value, lot.side.value, lot.active, lot)
             self._refresh_account_for_symbol(symbol=symbol)
 
             msg = (
@@ -415,6 +425,131 @@ class TradingRuntime:
             )
             return False
 
+    def switch_hyperliquid_network(self, network: str) -> tuple[bool, str]:
+        normalized = network.strip().lower()
+        if normalized not in {"testnet", "mainnet"}:
+            return (False, f"unsupported network: {network}")
+        if any(lot.active or not lot.exit_executed for lot in self.position_manager.lots):
+            return (False, "close all positions before switching Hyperliquid network")
+        api_url, ws_url = resolve_hyperliquid_endpoints(normalized)
+        self.config.hyperliquid.network = normalized
+        self.config.hyperliquid.api_url = api_url
+        self.config.hyperliquid.ws_url = ws_url
+        if isinstance(self.data_client, HyperliquidMarketDataClient):
+            self.data_client.config = self.config.hyperliquid
+        if self.execution_engine is not None and isinstance(self.execution_engine.adapter, HyperliquidLiveAdapter):
+            self.execution_engine.adapter.update_network(normalized)
+        self.storage.insert_system_event(
+            utc_now(),
+            "hyperliquid_network_switched",
+            {"network": normalized, "api_url": api_url, "ws_url": ws_url},
+        )
+        return (True, normalized)
+
+    def _monitor_open_positions(self) -> int:
+        managed_symbols = sorted({
+            lot.symbol.upper()
+            for lot in self.position_manager.lots
+            if lot.active or not lot.exit_executed
+        })
+        if not managed_symbols:
+            return 0
+
+        exits = 0
+        for symbol in managed_symbols:
+            try:
+                snapshot = self.data_client.fetch_snapshot(symbol)
+            except Exception as exc:
+                self.storage.insert_system_event(
+                    utc_now(),
+                    "position_monitor_snapshot_error",
+                    {"symbol": symbol, "error": type(exc).__name__, "message": str(exc)},
+                )
+                exits += self._flush_pending_position_exits(symbol, None)
+                continue
+            atr_15m = self._atr_from_candles(snapshot.candles_15m)
+            events = self.position_manager.update(
+                snapshot=snapshot,
+                atr_15m=atr_15m,
+                is_15m_close=True,
+                risk_extreme=snapshot.risk_extreme,
+            )
+            if events:
+                self.storage.insert_system_event(
+                    utc_now(),
+                    "position_monitor_events",
+                    {"symbol": symbol, "events": events},
+                )
+            exits += self._flush_pending_position_exits(symbol, snapshot)
+        self._refresh_account_for_symbol(symbol="")
+        return exits
+
+    def _flush_pending_position_exits(self, symbol: str, snapshot: MarketSnapshot | None = None) -> int:
+        if self.execution_engine is None:
+            return 0
+
+        pending = [
+            lot
+            for lot in self.position_manager.lots
+            if lot.symbol.upper() == symbol.upper() and not lot.exit_executed and (not lot.active or bool(lot.exit_reason))
+        ]
+        if not pending:
+            return 0
+
+        submitted = 0
+        for lot in pending:
+            close_side = Side.SHORT if lot.side == Side.LONG else Side.LONG
+            request_id = f"exit-{lot.symbol}-{lot.kind.value}-{lot.exit_reason}-{lot.opened_at.isoformat() if lot.opened_at else 'na'}"
+            try:
+                order = self.execution_engine.place(
+                    request_id=request_id,
+                    symbol=lot.symbol,
+                    side=close_side,
+                    quantity=lot.quantity,
+                    price=None,
+                    reduce_only=True,
+                )
+                lot.exit_executed = True
+                exit_price = snapshot.mark_price if snapshot is not None else lot.current_stop
+                lot.realized_pnl = self.position_manager._pnl(lot, exit_price)
+                payload = {
+                    "symbol": lot.symbol,
+                    "kind": lot.kind.value,
+                    "side": lot.side.value,
+                    "quantity": lot.quantity,
+                    "exit_reason": lot.exit_reason or "manual_close",
+                    "order": order,
+                    "snapshot_price": exit_price,
+                }
+                if order is not None:
+                    self.storage.insert_order(utc_now(), order.client_order_id, lot.symbol, close_side.value, order.status, order)
+                self.storage.insert_position_lot(utc_now(), lot.symbol, lot.kind.value, lot.side.value, False, lot)
+                self.storage.insert_system_event(utc_now(), "position_exit_submitted", payload)
+                msg = (
+                    f"[EXIT] {lot.symbol} {lot.side.value} {lot.kind.value}\n"
+                    f"reason: {lot.exit_reason or 'manual_close'}\n"
+                    f"qty: {lot.quantity:.6f}\n"
+                    f"est_exit: {exit_price:.6f}"
+                )
+                self.notifier.send_text(msg[:3800])
+                submitted += 1
+            except Exception as exc:
+                self.storage.insert_system_event(
+                    utc_now(),
+                    "position_exit_submit_error",
+                    {
+                        "symbol": lot.symbol,
+                        "kind": lot.kind.value,
+                        "side": lot.side.value,
+                        "quantity": lot.quantity,
+                        "exit_reason": lot.exit_reason,
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
+        self._refresh_account_for_symbol(symbol="")
+        return submitted
+
     def _scale_quantity_by_budget(self, quantity: float, risk_left_pct: float) -> float:
         if quantity <= 0:
             return 0.0
@@ -424,7 +559,7 @@ class TradingRuntime:
 
     def _has_active_lots(self, symbol: str) -> bool:
         for lot in self.position_manager.lots:
-            if lot.active and lot.symbol.upper() == symbol.upper():
+            if lot.symbol.upper() == symbol.upper() and (lot.active or not lot.exit_executed):
                 return True
         return False
 
@@ -529,7 +664,35 @@ class TradingRuntime:
                     reasons=["market_region_restricted"],
                     timeframe_mode=timeframe_mode if isinstance(timeframe_mode, str) else "auto",
                 )
-            raise
+            message = (
+                f"[不适合] {symbol}\n"
+                f"原因: 行情接口返回HTTP {status_code}，本轮跳过。\n"
+                "处理: 通常是测试网临时波动，稍后重试即可。"
+            )
+            self.storage.insert_system_event(
+                utc_now(),
+                "market_http_status_error",
+                {
+                    "symbol": symbol,
+                    "status_code": status_code,
+                    "url": str(exc.request.url) if exc.request else None,
+                    "message": str(exc),
+                },
+            )
+            if push_to_telegram and self.config.telegram.send_rejections:
+                ok, reason = self.notifier.send_text(message)
+                self.storage.insert_system_event(
+                    utc_now(),
+                    "telegram_http_status_notice",
+                    {"symbol": symbol, "status_code": status_code, "sent": ok, "reason": reason},
+                )
+            return SymbolAnalysis(
+                symbol=symbol,
+                suitable=False,
+                message=message,
+                reasons=["market_http_status_error"],
+                timeframe_mode=timeframe_mode if isinstance(timeframe_mode, str) else "auto",
+            )
         except httpx.RequestError as exc:
             message = (
                 f"[不适合] {symbol}\n"
@@ -703,7 +866,7 @@ class TradingRuntime:
         )
 
     def _refresh_account_for_symbol(self, symbol: str) -> None:
-        active_lots = [lot for lot in self.position_manager.lots if lot.active]
+        active_lots = [lot for lot in self.position_manager.lots if lot.active or not lot.exit_executed]
         unique_positions = {(lot.symbol.upper(), lot.side.value) for lot in active_lots}
         self.account.open_positions = len(unique_positions)
         self.account.open_risk_pct = min(

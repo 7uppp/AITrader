@@ -30,6 +30,7 @@ VIEWER_COMMANDS = {
     "/status",
     "/help",
     "/positions",
+    "/net",
 }
 TRADER_COMMANDS = VIEWER_COMMANDS | {"/result", "/win", "/loss"}
 ADMIN_COMMANDS = TRADER_COMMANDS | {"/pause", "/resume", "/riskoff", "/closeall", "/killswitch", "/confirm"}
@@ -95,8 +96,23 @@ class TelegramCommandBot:
                 )
                 continue
 
-            self._handle_text_command(text, chat_id=chat_id, user_id=user_id, role=role)
-            handled += 1
+            try:
+                self._handle_text_command(text, chat_id=chat_id, user_id=user_id, role=role)
+                handled += 1
+            except Exception as exc:
+                self.runtime.storage.insert_system_event(
+                    utc_now(),
+                    "telegram_command_handler_error",
+                    {
+                        "chat_id": chat_id,
+                        "user_id": user_id,
+                        "role": role,
+                        "text": text,
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
+                self._reply(chat_id, f"Command failed: {type(exc).__name__}. Check logs and retry.")
 
         self._save_offset(max_update_id)
         return f"handled:{handled}"
@@ -136,6 +152,10 @@ class TelegramCommandBot:
                 self._reply(chat_id, "Cannot switch mode from KILLED.")
                 return
             self._set_mode(SystemMode.RISK_OFF, chat_id=chat_id, event="telegram_riskoff_command")
+            return
+
+        if lower.startswith("/net"):
+            self._handle_net_command(normalized, chat_id=chat_id, user_id=user_id, role=role)
             return
 
         if lower.startswith("/scan") or self._looks_like_compact_scan(lower):
@@ -223,6 +243,8 @@ class TelegramCommandBot:
             msg = (
                 f"mode: {self.runtime.mode.value}\n"
                 f"exchange: {self.runtime.config.exchange.kind}\n"
+                f"network: {self.runtime.config.hyperliquid.network}\n"
+                f"hyperliquid_api: {self.runtime.config.hyperliquid.api_url}\n"
                 f"auto_trade: {self.runtime.config.runtime.auto_trade_enabled and not self.runtime.config.runtime.advisory_only}\n"
                 f"watchlist: {', '.join(self.runtime.config.trading.symbols)}\n"
                 "positions: /positions\n"
@@ -254,6 +276,7 @@ class TelegramCommandBot:
                 "/active -> show active unclosed advices\n"
                 "/alive -> bot health check\n"
                 "/status -> runtime status summary\n"
+                "/net status|testnet|mainnet -> show or switch Hyperliquid network\n"
                 "/result ABC123 win 1.2 -> report by short id\n"
                 "/result last win 1.2 -> report latest active advice\n"
                 "/result A-BTC-... win 1.2 -> report by full advice id\n"
@@ -298,6 +321,7 @@ class TelegramCommandBot:
             {"command": "active", "description": "Show active advices"},
             {"command": "alive", "description": "Check bot is alive"},
             {"command": "status", "description": "Show system status"},
+            {"command": "net", "description": "Show or switch network"},
             {"command": "help", "description": "Show command help"},
             {"command": "result", "description": "Report advice result by ID"},
             {"command": "pause", "description": "Pause new entries (admin)"},
@@ -386,7 +410,7 @@ class TelegramCommandBot:
             )
             return
 
-        active = [lot for lot in pm.lots if getattr(lot, "active", False)]
+        active = [lot for lot in pm.lots if getattr(lot, "active", False) or not getattr(lot, "exit_executed", True)]
         if not active:
             ok, reason = self._reply(chat_id, "No open positions.")
             self.runtime.storage.insert_system_event(
@@ -399,10 +423,13 @@ class TelegramCommandBot:
         lines = [f"Open positions ({len(active)} lots):"]
         for lot in active:
             tp = f"{lot.take_profit:.6f}" if lot.take_profit is not None else "-"
+            opened = lot.opened_at.isoformat(timespec="seconds") if getattr(lot, "opened_at", None) else "-"
             lines.append(
                 f"{lot.symbol} {lot.side.value} {lot.kind.value} | qty={lot.quantity:.6f} "
                 f"entry={lot.avg_entry:.6f} stop={lot.current_stop:.6f} tp={tp} "
-                f"trail={lot.trailing_armed} be={lot.breakeven_armed}"
+                f"trail={lot.trailing_armed} be={lot.breakeven_armed} "
+                f"tf={getattr(lot, 'entry_timeframe', '-')} bars15={getattr(lot, 'bars_held_15m', 0)} "
+                f"bars1h={getattr(lot, 'bars_held_1h', 0)} opened={opened} exit={getattr(lot, 'exit_reason', '') or '-'}"
             )
         ok, reason = self._reply(chat_id, "\n".join(lines))
         self.runtime.storage.insert_system_event(
@@ -550,6 +577,15 @@ class TelegramCommandBot:
             self.runtime.mode = SystemMode.KILLED
             msg = "killswitch executed. Mode set to KILLED."
             event = "telegram_killswitch_executed"
+        elif action.startswith("/net "):
+            network = action.split(" ", maxsplit=1)[1].strip().lower()
+            ok, result = self.runtime.switch_hyperliquid_network(network)
+            if ok:
+                msg = f"Hyperliquid network switched to {result}."
+                event = "telegram_network_switched"
+            else:
+                msg = f"Network switch failed: {result}"
+                event = "telegram_network_switch_failed"
         else:
             msg = f"Unknown confirmed action: {action}"
             event = "telegram_confirm_unknown_action"
@@ -565,6 +601,69 @@ class TelegramCommandBot:
         ok, reason = self._reply(chat_id, f"Mode -> {mode.value}")
         self.runtime.storage.insert_system_event(utc_now(), event, {"mode": mode.value, "sent": ok, "reason": reason, "chat_id": chat_id})
 
+    def _handle_net_command(self, text: str, chat_id: str, user_id: str, role: str) -> None:
+        parts = [p for p in text.strip().split(" ") if p]
+        if len(parts) < 2:
+            self._reply(chat_id, self._network_status_text())
+            self.runtime.storage.insert_system_event(
+                utc_now(),
+                "telegram_network_status_command",
+                {"chat_id": chat_id, "user_id": user_id, "role": role, "network": self.runtime.config.hyperliquid.network},
+            )
+            return
+
+        target = parts[1].strip().lower()
+        if target == "status":
+            self._reply(chat_id, self._network_status_text())
+            self.runtime.storage.insert_system_event(
+                utc_now(),
+                "telegram_network_status_command",
+                {"chat_id": chat_id, "user_id": user_id, "role": role, "network": self.runtime.config.hyperliquid.network},
+            )
+            return
+
+        if role != "admin":
+            self._reply(chat_id, "Permission denied for network switch. Ask an admin.")
+            self.runtime.storage.insert_system_event(
+                utc_now(),
+                "telegram_network_switch_denied",
+                {"chat_id": chat_id, "user_id": user_id, "role": role, "target": target},
+            )
+            return
+
+        if target not in {"testnet", "mainnet"}:
+            self._reply(chat_id, "Usage: /net status|testnet|mainnet")
+            return
+
+        current = self.runtime.config.hyperliquid.network.strip().lower()
+        if target == current:
+            self._reply(chat_id, self._network_status_text())
+            return
+
+        if target == "mainnet":
+            self._request_danger_confirm(action="/net mainnet", chat_id=chat_id, user_id=user_id)
+            return
+
+        ok, result = self.runtime.switch_hyperliquid_network("testnet")
+        if ok:
+            self._reply(chat_id, f"Hyperliquid network switched to {result}.")
+        else:
+            self._reply(chat_id, f"Network switch failed: {result}")
+        self.runtime.storage.insert_system_event(
+            utc_now(),
+            "telegram_network_switch_command",
+            {"chat_id": chat_id, "user_id": user_id, "role": role, "target": target, "ok": ok, "result": result},
+        )
+
+    def _network_status_text(self) -> str:
+        cfg = self.runtime.config.hyperliquid
+        return (
+            f"Hyperliquid network: {cfg.network}\n"
+            f"API: {cfg.api_url}\n"
+            f"WS: {cfg.ws_url}\n"
+            "Use /net testnet or /net mainnet (mainnet requires confirmation and admin rights)."
+        )
+
     def _close_all_positions(self) -> None:
         pm = getattr(self.runtime, "position_manager", None)
         if pm is not None and hasattr(pm, "close_all"):
@@ -575,9 +674,26 @@ class TelegramCommandBot:
         engine = getattr(self.runtime, "execution_engine", None)
         if engine is not None and hasattr(engine, "close_all"):
             try:
-                engine.close_all(self.runtime.config.trading.symbols)
+                live_symbols = sorted({
+                    lot.symbol
+                    for lot in getattr(pm, "lots", [])
+                    if getattr(lot, "active", False) or not getattr(lot, "exit_executed", True)
+                })
+                engine.close_all(live_symbols or self.runtime.config.trading.symbols)
             except Exception:
                 pass
+        flush = getattr(self.runtime, "_flush_pending_position_exits", None)
+        if callable(flush):
+            live_symbols = sorted({
+                lot.symbol
+                for lot in getattr(pm, "lots", [])
+                if getattr(lot, "active", False) or not getattr(lot, "exit_executed", True)
+            })
+            for symbol in live_symbols or self.runtime.config.trading.symbols:
+                try:
+                    flush(symbol, None)
+                except Exception:
+                    pass
         self.runtime._refresh_account_for_symbol(symbol="")
 
     def _resolve_advice_target(self, target: str, now: datetime) -> tuple[str | None, str | None]:

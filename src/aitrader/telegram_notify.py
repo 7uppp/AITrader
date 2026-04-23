@@ -45,7 +45,10 @@ class TelegramNotifier:
         if offset is not None:
             payload["offset"] = offset
         try:
-            with httpx.Client(timeout=self.timeout_seconds) as client:
+            # Long-poll timeout should always be shorter than HTTP client timeout.
+            poll_timeout = max(1, int(timeout_seconds))
+            client_timeout = max(self.timeout_seconds, float(poll_timeout) + 5.0)
+            with httpx.Client(timeout=client_timeout) as client:
                 resp = client.get(
                     f"https://api.telegram.org/bot{self.config.bot_token}/getUpdates",
                     params=payload,

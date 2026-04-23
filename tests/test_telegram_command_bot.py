@@ -45,12 +45,18 @@ def _bot(tmp_path: Path) -> TelegramCommandBot:
     runtime = SimpleNamespace(
         config=SimpleNamespace(
             trading=SimpleNamespace(symbols=["BTCUSDT", "ETHUSDT"]),
+            hyperliquid=SimpleNamespace(
+                network="testnet",
+                api_url="https://api.hyperliquid-testnet.xyz",
+                ws_url="wss://api.hyperliquid-testnet.xyz/ws",
+            ),
         ),
         notifier=_NotifierStub(),
         storage=storage_stub,
         analyze_symbols=lambda symbols, push_to_telegram=False, timeframe_mode="auto", manual_total_usdt=None: [],
         mode=SystemMode.RUNNING,
         _refresh_account_for_symbol=lambda symbol="": None,
+        switch_hyperliquid_network=lambda network: (True, network),
     )
     return TelegramCommandBot(runtime=runtime, notifier=runtime.notifier, offset_path=tmp_path / "offset.txt")
 
@@ -161,6 +167,7 @@ def test_menu_commands_and_alive_command(tmp_path: Path):
         "active",
         "alive",
         "status",
+        "net",
         "help",
         "result",
         "pause",
@@ -220,3 +227,20 @@ def test_closeall_requires_confirm_then_executes(tmp_path: Path):
     code = bot.pending_confirms[key].code
     bot._handle_text_command(f"/confirm {code}", chat_id="100", user_id="200", role="admin")
     assert bot.runtime.mode == SystemMode.PAUSED
+
+
+def test_net_status_is_visible_and_switch_requires_admin(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot._handle_text_command("/net status", chat_id="100", user_id="200", role="viewer")
+    assert any("Hyperliquid network: testnet" in text for text in bot.notifier.sent_texts)
+
+    bot.notifier.sent_texts.clear()
+    bot._handle_text_command("/net mainnet", chat_id="100", user_id="200", role="viewer")
+    assert any("Permission denied" in text for text in bot.notifier.sent_texts)
+
+
+def test_net_mainnet_requires_confirm(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot._handle_text_command("/net mainnet", chat_id="100", user_id="200", role="admin")
+    key = "100:200"
+    assert key in bot.pending_confirms

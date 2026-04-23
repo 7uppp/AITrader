@@ -82,7 +82,8 @@ def main() -> None:
         print(
             f"serve=started scan={scan_seconds}s poll_timeout={timeout_seconds}s "
             f"cooldown={cfg.runtime.advisory_cooldown_minutes}m "
-            f"exchange={cfg.exchange.kind} auto_trade={cfg.runtime.auto_trade_enabled and not cfg.runtime.advisory_only}"
+            f"exchange={cfg.exchange.kind} network={cfg.hyperliquid.network} "
+            f"auto_trade={cfg.runtime.auto_trade_enabled and not cfg.runtime.advisory_only}"
         )
         next_scan = time.monotonic()
         try:

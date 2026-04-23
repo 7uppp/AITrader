@@ -1,10 +1,18 @@
+from pathlib import Path
+
+from aitrader.config import AppConfig
+
+
+def _write_config(path: Path, hyperliquid_block: str = "") -> None:
+    path.write_text(
+        f"""
 [system]
 name = "aitrader"
 mode = "RUNNING"
 timezone = "UTC"
 
 [trading]
-symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "DOTUSDT", "SOLUSDT"]
+symbols = ["BTCUSDT"]
 leverage = 1.0
 max_leverage_hard = 3.0
 allow_long = true
@@ -19,28 +27,6 @@ runner_trailing_activation_r = 1.5
 runner_trailing_atr_mult = 2.2
 runner_trailing_atr_mult_tight = 1.8
 risk_extreme_mode_tighten_trailing = true
-primary_timeframe_mode = "1h_primary"
-use_4h_trend_bias = true
-ema_fast_period = 20
-ema_mid_period = 50
-ema_slow_period = 200
-rsi_period = 14
-rsi_long_min = 45.0
-rsi_long_max = 68.0
-rsi_short_min = 32.0
-rsi_short_max = 55.0
-bb_period = 20
-bb_stddev = 2.0
-trigger_breakout_lookback_15m = 6
-trigger_volume_sma_period = 20
-trigger_volume_multiplier = 1.0
-signal_min_confidence = 0.58
-time_stop_soft_minutes_1h = 90
-time_stop_hard_minutes_1h = 120
-time_stop_soft_minutes_15m = 45
-time_stop_hard_minutes_15m = 60
-stalled_progress_r_threshold = 0.5
-stalled_atr_percentile_max = 0.35
 
 [risk]
 single_trade_risk_pct = 0.25
@@ -64,28 +50,35 @@ fee_buffer_bps = 8.0
 slippage_buffer_bps = 10.0
 tick_buffer_bps = 1.0
 
-[telemetry]
-log_level = "INFO"
-
 [runtime]
 database_path = "data/aitrader.db"
 dry_run = true
 loop_interval_seconds = 15
 advisory_only = true
 telegram_offset_path = "data/telegram_offset.txt"
-advisory_cooldown_minutes = 10
-assumed_equity_usd = 10000.0
-auto_trade_enabled = false
-max_candidates_per_cycle = 3
-execution_cooldown_seconds = 600
 
-[exchange]
-kind = "hyperliquid"
+{hyperliquid_block}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
 
-[binance]
-base_url = "https://fapi.binance.com"
-request_timeout_seconds = 8.0
 
+def test_default_hyperliquid_network_is_testnet(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = tmp_path / "config.toml"
+    _write_config(cfg_path)
+    monkeypatch.delenv("AITRADER_HL_NETWORK", raising=False)
+    cfg = AppConfig.load(cfg_path)
+    assert cfg.hyperliquid.network == "testnet"
+    assert cfg.hyperliquid.api_url == "https://api.hyperliquid-testnet.xyz"
+    assert cfg.hyperliquid.ws_url == "wss://api.hyperliquid-testnet.xyz/ws"
+
+
+def test_env_can_override_network_to_mainnet(tmp_path: Path, monkeypatch) -> None:
+    cfg_path = tmp_path / "config.toml"
+    _write_config(
+        cfg_path,
+        """
 [hyperliquid]
 network = "testnet"
 api_url = "https://api.hyperliquid-testnet.xyz"
@@ -93,14 +86,10 @@ ws_url = "wss://api.hyperliquid-testnet.xyz/ws"
 vault_address = ""
 private_key = ""
 request_timeout_seconds = 8.0
-
-[telegram]
-enabled = true
-bot_token = "REPLACE_WITH_YOUR_BOT_TOKEN"
-chat_id = "REPLACE_WITH_YOUR_CHAT_ID"
-send_rejections = true
-allowed_chat_ids = []
-admin_user_ids = []
-trader_user_ids = []
-viewer_user_ids = []
-confirm_ttl_seconds = 45
+""".strip(),
+    )
+    monkeypatch.setenv("AITRADER_HL_NETWORK", "mainnet")
+    cfg = AppConfig.load(cfg_path)
+    assert cfg.hyperliquid.network == "mainnet"
+    assert cfg.hyperliquid.api_url == "https://api.hyperliquid.xyz"
+    assert cfg.hyperliquid.ws_url == "wss://api.hyperliquid.xyz/ws"

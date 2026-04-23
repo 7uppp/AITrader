@@ -123,6 +123,14 @@ class PositionLot:
     trailing_armed: bool = False
     breakeven_armed: bool = False
     realized_pnl: float = 0.0
+    opened_at: datetime | None = None
+    entry_timeframe: str = "1h_primary"
+    bars_held_15m: int = 0
+    bars_held_1h: int = 0
+    last_signal_state: str = ""
+    exit_reason: str = ""
+    exit_executed: bool = False
+    closed_at: datetime | None = None
 
 
 ControlAction = Literal[

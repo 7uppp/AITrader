@@ -40,8 +40,7 @@ class Backtester:
                 result.trades += 1
                 result.events.append(f"{snapshot.ts.isoformat()} open:{signal.symbol}:{signal.side.value}:{decision.quantity:.6f}")
             events = self.position_manager.update(
-                symbol=snapshot.symbol,
-                last_price=snapshot.mark_price,
+                snapshot=snapshot,
                 atr_15m=0.0,
                 is_15m_close=(idx % 1 == 0),
                 risk_extreme=snapshot.risk_extreme,
