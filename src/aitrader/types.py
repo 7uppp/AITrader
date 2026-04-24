@@ -131,6 +131,7 @@ class PositionLot:
     exit_reason: str = ""
     exit_executed: bool = False
     closed_at: datetime | None = None
+    advice_id: str = ""
 
 
 ControlAction = Literal[

@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import json
 
 from aitrader.config import TelegramConfig
 from aitrader.telegram_command_bot import TelegramCommandBot
@@ -41,10 +42,13 @@ def _bot(tmp_path: Path) -> TelegramCommandBot:
         list_active_advices=lambda now=None: [],
         get_latest_active_advice=lambda now=None: None,
         get_advice_ids_by_suffix=lambda suffix, status=None, limit=20: [],
+        get_latest_trade_feedback=lambda source=None: None,
     )
     runtime = SimpleNamespace(
         config=SimpleNamespace(
+            exchange=SimpleNamespace(kind="hyperliquid"),
             trading=SimpleNamespace(symbols=["BTCUSDT", "ETHUSDT"]),
+            runtime=SimpleNamespace(auto_trade_enabled=True, advisory_only=False),
             hyperliquid=SimpleNamespace(
                 network="testnet",
                 api_url="https://api.hyperliquid-testnet.xyz",
@@ -244,3 +248,16 @@ def test_net_mainnet_requires_confirm(tmp_path: Path):
     bot._handle_text_command("/net mainnet", chat_id="100", user_id="200", role="admin")
     key = "100:200"
     assert key in bot.pending_confirms
+
+
+def test_status_contains_latest_auto_settlement(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot.runtime.storage.get_latest_trade_feedback = lambda source=None: {
+        "advice_id": "A-BTC-1H-20260420153012-ABC123",
+        "symbol": "BTCUSDT",
+        "pnl_pct": 1.25,
+        "payload_json": json.dumps({"source": "auto_trade", "total_pnl_usd": 12.34}),
+    }
+    bot._handle_text_command("/status", chat_id="100", user_id="200", role="viewer")
+    payload = "\n".join(bot.notifier.sent_texts)
+    assert "last_auto_settlement: BTCUSDT ABC123 12.3400 USD (1.25%)" in payload

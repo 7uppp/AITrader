@@ -21,7 +21,7 @@ from .storage import ActiveAdvice, Storage
 from .strategy import SignalEngine, TimeframeMode
 from .telegram_notify import TelegramNotifier
 from .time_utils import utc_now
-from .types import AccountState, MarketSnapshot, Side, SignalIntent, SystemMode
+from .types import AccountState, LotKind, MarketSnapshot, PositionLot, Side, SignalIntent, SystemMode
 
 
 SIGNAL_REASON_MAP: dict[str, str] = {
@@ -388,6 +388,7 @@ class TradingRuntime:
                 opened_at=utc_now(),
                 entry_timeframe=candidate.advisory.timeframe_mode,
                 last_signal_state=f"{candidate.advisory.timeframe_mode}:{candidate.advisory.trigger_source}",
+                advice_id=candidate.advice_id,
             )
             for lot in lots:
                 self.storage.insert_position_lot(utc_now(), lot.symbol, lot.kind.value, lot.side.value, lot.active, lot)
@@ -396,6 +397,7 @@ class TradingRuntime:
             msg = (
                 "[AUTO EXECUTED]\n"
                 f"exchange={self.config.exchange.kind}\n"
+                f"network={self.config.hyperliquid.network}\n"
                 f"score={candidate.score:.3f}\n"
                 f"symbol={symbol} side={side.value}\n"
                 f"entry={entry_price:.6f} stop={candidate.advisory.stop_loss:.6f} tp_main={candidate.advisory.main_take_profit:.6f}\n"
@@ -497,6 +499,7 @@ class TradingRuntime:
             return 0
 
         submitted = 0
+        finalized_advice_ids: set[str] = set()
         for lot in pending:
             close_side = Side.SHORT if lot.side == Side.LONG else Side.LONG
             request_id = f"exit-{lot.symbol}-{lot.kind.value}-{lot.exit_reason}-{lot.opened_at.isoformat() if lot.opened_at else 'na'}"
@@ -533,6 +536,10 @@ class TradingRuntime:
                 )
                 self.notifier.send_text(msg[:3800])
                 submitted += 1
+                advice_id = lot.advice_id.strip()
+                if advice_id and advice_id not in finalized_advice_ids:
+                    self._maybe_finalize_trade_for_advice(advice_id)
+                    finalized_advice_ids.add(advice_id)
             except Exception as exc:
                 self.storage.insert_system_event(
                     utc_now(),
@@ -549,6 +556,117 @@ class TradingRuntime:
                 )
         self._refresh_account_for_symbol(symbol="")
         return submitted
+
+    def _maybe_finalize_trade_for_advice(self, advice_id: str) -> bool:
+        normalized = advice_id.strip()
+        if not normalized:
+            return False
+        lots = self._lots_for_advice(normalized)
+        if not lots:
+            return False
+        if any(not lot.exit_executed for lot in lots):
+            return False
+        if self.storage.has_feedback_for_advice(normalized):
+            return False
+
+        settled_at = utc_now()
+        main_pnl = sum(lot.realized_pnl for lot in lots if lot.kind == LotKind.MAIN)
+        runner_pnl = sum(lot.realized_pnl for lot in lots if lot.kind == LotKind.RUNNER)
+        total_pnl_usd = main_pnl + runner_pnl
+        entry_notional = sum(abs(lot.avg_entry * lot.quantity) for lot in lots)
+        pnl_pct: float | None = None
+        pct_note = ""
+        if entry_notional > 0:
+            pnl_pct = (total_pnl_usd / entry_notional) * 100.0
+        else:
+            pct_note = "entry_notional_missing"
+
+        symbol = lots[0].symbol
+        exit_reasons = sorted({(lot.exit_reason or "manual_close") for lot in lots})
+        outcome = "WIN" if total_pnl_usd >= 0 else "LOSS"
+        payload = {
+            "source": "auto_trade",
+            "symbol": symbol,
+            "advice_id": normalized,
+            "network": self.config.hyperliquid.network,
+            "lot_count": len(lots),
+            "main_pnl_usd": main_pnl,
+            "runner_pnl_usd": runner_pnl,
+            "total_pnl_usd": total_pnl_usd,
+            "entry_notional_usd": entry_notional,
+            "pnl_pct_compute_note": pct_note,
+            "exit_reasons": exit_reasons,
+            "lots": [
+                {
+                    "kind": lot.kind.value,
+                    "qty": lot.quantity,
+                    "entry": lot.avg_entry,
+                    "realized_pnl": lot.realized_pnl,
+                    "exit_reason": lot.exit_reason or "manual_close",
+                    "closed_at": lot.closed_at.isoformat() if lot.closed_at is not None else None,
+                }
+                for lot in lots
+            ],
+        }
+        try:
+            self.storage.insert_trade_feedback(
+                ts=settled_at,
+                advice_id=normalized,
+                symbol=symbol,
+                outcome=outcome,
+                pnl_pct=pnl_pct,
+                note="auto_settled",
+                payload=payload,
+            )
+            self.storage.close_advice_record(advice_id=normalized, closed_ts=settled_at)
+            self.storage.insert_system_event(
+                settled_at,
+                "auto_trade_settled",
+                {
+                    "advice_id": normalized,
+                    "symbol": symbol,
+                    "outcome": outcome,
+                    "main_pnl_usd": main_pnl,
+                    "runner_pnl_usd": runner_pnl,
+                    "total_pnl_usd": total_pnl_usd,
+                    "pnl_pct": pnl_pct,
+                    "exit_reasons": exit_reasons,
+                },
+            )
+            pct_text = f"{pnl_pct:.2f}%" if pnl_pct is not None else "N/A"
+            settle_msg = (
+                "[AUTO SETTLED]\n"
+                f"exchange={self.config.exchange.kind} network={self.config.hyperliquid.network}\n"
+                f"symbol={symbol} advice_id={normalized}\n"
+                f"pnl_main={main_pnl:.4f} USD\n"
+                f"pnl_runner={runner_pnl:.4f} USD\n"
+                f"pnl_total={total_pnl_usd:.4f} USD ({pct_text})\n"
+                f"exit_reasons={','.join(exit_reasons)}"
+            )
+            self.notifier.send_text(settle_msg[:3800])
+            return True
+        except Exception as exc:
+            self.storage.insert_system_event(
+                settled_at,
+                "auto_trade_settle_error",
+                {
+                    "advice_id": normalized,
+                    "symbol": symbol,
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            return False
+
+    def _lots_for_advice(self, advice_id: str) -> list[PositionLot]:
+        normalized = advice_id.strip()
+        if not normalized:
+            return []
+        return [
+            lot
+            for lot in self.position_manager.lots
+            if lot.advice_id.strip() == normalized
+        ]
 
     def _scale_quantity_by_budget(self, quantity: float, risk_left_pct: float) -> float:
         if quantity <= 0:

@@ -203,3 +203,31 @@ def test_get_latest_active_advice(tmp_path: Path):
     latest = storage.get_latest_active_advice(now=now)
     assert latest is not None
     assert latest.advice_id == "A-ETH-1H-20260420160400-NEW222"
+
+
+def test_get_latest_trade_feedback_by_source(tmp_path: Path):
+    db = tmp_path / "feedback_source.db"
+    storage = Storage(db)
+    storage.init_schema()
+    now = datetime.now(UTC)
+    storage.insert_trade_feedback(
+        ts=now - timedelta(minutes=2),
+        advice_id="A-BTC-1H-OLD",
+        symbol="BTCUSDT",
+        outcome="WIN",
+        pnl_pct=0.8,
+        note="manual",
+        payload={"source": "telegram"},
+    )
+    storage.insert_trade_feedback(
+        ts=now - timedelta(minutes=1),
+        advice_id="A-ETH-1H-NEW",
+        symbol="ETHUSDT",
+        outcome="LOSS",
+        pnl_pct=-0.3,
+        note="auto",
+        payload={"source": "auto_trade", "total_pnl_usd": -3.2},
+    )
+    latest_auto = storage.get_latest_trade_feedback(source="auto_trade")
+    assert latest_auto is not None
+    assert latest_auto["advice_id"] == "A-ETH-1H-NEW"

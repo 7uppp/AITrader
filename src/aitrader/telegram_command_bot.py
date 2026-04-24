@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+import json
 import re
 import secrets
 import string
@@ -240,6 +241,7 @@ class TelegramCommandBot:
             return
 
         if lower.startswith("/status"):
+            latest_auto = self._latest_auto_settlement_text()
             msg = (
                 f"mode: {self.runtime.mode.value}\n"
                 f"exchange: {self.runtime.config.exchange.kind}\n"
@@ -247,6 +249,7 @@ class TelegramCommandBot:
                 f"hyperliquid_api: {self.runtime.config.hyperliquid.api_url}\n"
                 f"auto_trade: {self.runtime.config.runtime.auto_trade_enabled and not self.runtime.config.runtime.advisory_only}\n"
                 f"watchlist: {', '.join(self.runtime.config.trading.symbols)}\n"
+                f"{latest_auto}\n"
                 "positions: /positions\n"
                 "active advices: /active\n"
                 "alive check: /alive\n"
@@ -477,7 +480,7 @@ class TelegramCommandBot:
                 )
                 return
             if self.runtime.storage.has_feedback_for_advice(resolved_advice_id):
-                ok, reason = self._reply(chat_id, f"Already reported: {resolved_advice_id}")
+                ok, reason = self._reply(chat_id, f"Already recorded (auto/manual): {resolved_advice_id}")
                 self.runtime.storage.insert_system_event(
                     now,
                     "telegram_result_duplicate_advice",
@@ -807,6 +810,36 @@ class TelegramCommandBot:
             return float(token)
         except ValueError:
             return None
+
+    def _latest_auto_settlement_text(self) -> str:
+        getter = getattr(self.runtime.storage, "get_latest_trade_feedback", None)
+        if not callable(getter):
+            return "last_auto_settlement: unavailable"
+        row = getter(source="auto_trade")
+        if row is None:
+            return "last_auto_settlement: none"
+        payload = self._safe_json_loads(row["payload_json"])
+        advice_id = str(row["advice_id"] or "-")
+        short_id = advice_id.split("-")[-1] if advice_id != "-" else "-"
+        symbol = str(row["symbol"])
+        pnl_pct = row["pnl_pct"]
+        pnl_pct_text = "N/A" if pnl_pct is None else f"{float(pnl_pct):.2f}%"
+        total_pnl_usd = payload.get("total_pnl_usd")
+        if isinstance(total_pnl_usd, (float, int)):
+            pnl_usd_text = f"{float(total_pnl_usd):.4f} USD"
+        else:
+            pnl_usd_text = "N/A"
+        return f"last_auto_settlement: {symbol} {short_id} {pnl_usd_text} ({pnl_pct_text})"
+
+    @staticmethod
+    def _safe_json_loads(raw: object) -> dict[str, object]:
+        if not isinstance(raw, str):
+            return {}
+        try:
+            out = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return out if isinstance(out, dict) else {}
 
     def _role_allows(self, role: str, command_key: str) -> bool:
         if role == "admin":

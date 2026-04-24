@@ -371,6 +371,33 @@ class Storage:
             ).fetchone()
         return row is not None
 
+    def get_latest_trade_feedback(self, source: str | None = None) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT ts, advice_id, symbol, outcome, pnl_pct, note, payload_json
+                FROM trade_feedback
+                ORDER BY ts DESC
+                LIMIT 200
+                """
+            ).fetchall()
+        if source is None:
+            return rows[0] if rows else None
+        normalized = source.strip().lower()
+        if not normalized:
+            return rows[0] if rows else None
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            payload_source = str(payload.get("source", "")).strip().lower()
+            if payload_source == normalized:
+                return row
+        return None
+
     def get_active_advice(self, symbol: str, side: str, now: datetime | None = None) -> ActiveAdvice | None:
         active = self.list_active_advices(symbol=symbol, side=side, now=now)
         return active[0] if active else None

@@ -23,6 +23,7 @@ class PositionManager:
         opened_at: datetime | None = None,
         entry_timeframe: str = "1h_primary",
         last_signal_state: str = "",
+        advice_id: str = "",
     ) -> list[PositionLot]:
         if quantity <= 0:
             return []
@@ -47,6 +48,7 @@ class PositionManager:
             opened_at=opened,
             entry_timeframe=entry_timeframe,
             last_signal_state=last_signal_state,
+            advice_id=advice_id,
         )
         runner = PositionLot(
             symbol=signal.symbol,
@@ -61,6 +63,7 @@ class PositionManager:
             opened_at=opened,
             entry_timeframe=entry_timeframe,
             last_signal_state=last_signal_state,
+            advice_id=advice_id,
         )
         self.lots.extend([main, runner])
         return [main, runner]
