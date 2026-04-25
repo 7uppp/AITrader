@@ -48,7 +48,7 @@ def _bot(tmp_path: Path) -> TelegramCommandBot:
         config=SimpleNamespace(
             exchange=SimpleNamespace(kind="hyperliquid"),
             trading=SimpleNamespace(symbols=["BTCUSDT", "ETHUSDT"]),
-            runtime=SimpleNamespace(auto_trade_enabled=True, advisory_only=False),
+            runtime=SimpleNamespace(auto_trade_enabled=True, advisory_only=False, dry_run=True),
             hyperliquid=SimpleNamespace(
                 network="testnet",
                 api_url="https://api.hyperliquid-testnet.xyz",
@@ -61,6 +61,7 @@ def _bot(tmp_path: Path) -> TelegramCommandBot:
         mode=SystemMode.RUNNING,
         _refresh_account_for_symbol=lambda symbol="": None,
         switch_hyperliquid_network=lambda network: (True, network),
+        execution_engine=None,
     )
     return TelegramCommandBot(runtime=runtime, notifier=runtime.notifier, offset_path=tmp_path / "offset.txt")
 
@@ -174,6 +175,7 @@ def test_menu_commands_and_alive_command(tmp_path: Path):
         "net",
         "help",
         "result",
+        "smoketest",
         "pause",
         "resume",
         "riskoff",
@@ -261,3 +263,18 @@ def test_status_contains_latest_auto_settlement(tmp_path: Path):
     bot._handle_text_command("/status", chat_id="100", user_id="200", role="viewer")
     payload = "\n".join(bot.notifier.sent_texts)
     assert "last_auto_settlement: BTCUSDT ABC123 12.3400 USD (1.25%)" in payload
+
+
+def test_smoketest_runs_on_testnet_for_admin(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot._handle_text_command("/smoketest btc 0.001", chat_id="100", user_id="200", role="admin")
+    payload = "\n".join(bot.notifier.sent_texts)
+    assert "[SMOKETEST OK]" in payload
+
+
+def test_smoketest_blocked_on_mainnet(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot.runtime.config.hyperliquid.network = "mainnet"
+    bot._handle_text_command("/smoketest btc 0.001", chat_id="100", user_id="200", role="admin")
+    payload = "\n".join(bot.notifier.sent_texts)
+    assert "only allowed on testnet" in payload

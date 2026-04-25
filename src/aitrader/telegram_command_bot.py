@@ -11,7 +11,7 @@ import string
 from .runtime import TradingRuntime
 from .telegram_notify import TelegramNotifier
 from .time_utils import utc_now
-from .types import SystemMode
+from .types import Side, SystemMode
 
 SUPPORTED_TIMEFRAMES = {"15m", "1h", "hybrid", "1h_primary", "auto"}
 COMPACT_SYMBOLS = {
@@ -34,7 +34,7 @@ VIEWER_COMMANDS = {
     "/net",
 }
 TRADER_COMMANDS = VIEWER_COMMANDS | {"/result", "/win", "/loss"}
-ADMIN_COMMANDS = TRADER_COMMANDS | {"/pause", "/resume", "/riskoff", "/closeall", "/killswitch", "/confirm"}
+ADMIN_COMMANDS = TRADER_COMMANDS | {"/smoketest", "/pause", "/resume", "/riskoff", "/closeall", "/killswitch", "/confirm"}
 DANGEROUS_COMMANDS = {"/closeall", "/killswitch"}
 
 
@@ -159,6 +159,10 @@ class TelegramCommandBot:
             self._handle_net_command(normalized, chat_id=chat_id, user_id=user_id, role=role)
             return
 
+        if lower.startswith("/smoketest"):
+            self._handle_smoketest_command(normalized, chat_id=chat_id, user_id=user_id, role=role)
+            return
+
         if lower.startswith("/scan") or self._looks_like_compact_scan(lower):
             symbols, timeframe, manual_total_usdt, errors = self._parse_symbols_and_timeframe(normalized)
             if errors:
@@ -254,7 +258,8 @@ class TelegramCommandBot:
                 "active advices: /active\n"
                 "alive check: /alive\n"
                 "result report: /result <short_id|full_id|last> win 1.2\n"
-                "quick report: /win BTCUSDT 0.8 or /loss ETHUSDT -0.6"
+                "quick report: /win BTCUSDT 0.8 or /loss ETHUSDT -0.6\n"
+                "smoke test: /smoketest BTCUSDT 0.001 (admin, testnet only)"
             )
             ok, reason = self._reply(chat_id, msg)
             self.runtime.storage.insert_system_event(
@@ -285,6 +290,7 @@ class TelegramCommandBot:
                 "/result A-BTC-... win 1.2 -> report by full advice id\n"
                 "/win SOLUSDT 0.8 -> quick win report\n"
                 "/loss ETHUSDT -0.6 -> quick loss report\n"
+                "/smoketest BTCUSDT 0.001 -> open then close test order (admin, testnet only)\n"
                 "/pause /resume /riskoff -> admin mode controls\n"
                 "/closeall /killswitch -> admin only with /confirm CODE"
             )
@@ -327,6 +333,7 @@ class TelegramCommandBot:
             {"command": "net", "description": "Show or switch network"},
             {"command": "help", "description": "Show command help"},
             {"command": "result", "description": "Report advice result by ID"},
+            {"command": "smoketest", "description": "Open+close smoke test (admin)"},
             {"command": "pause", "description": "Pause new entries (admin)"},
             {"command": "resume", "description": "Resume running (admin)"},
             {"command": "riskoff", "description": "Risk-off mode (admin)"},
@@ -535,6 +542,105 @@ class TelegramCommandBot:
                 "role": role,
             },
         )
+
+    def _handle_smoketest_command(self, text: str, chat_id: str, user_id: str, role: str) -> None:
+        if role != "admin":
+            self._reply(chat_id, "Permission denied for /smoketest. Admin only.")
+            return
+
+        if self.runtime.config.exchange.kind.strip().lower() != "hyperliquid":
+            self._reply(chat_id, "Smoke test currently supports Hyperliquid only.")
+            return
+
+        if self.runtime.config.hyperliquid.network.strip().lower() != "testnet":
+            self._reply(chat_id, "Blocked: /smoketest only allowed on testnet.")
+            return
+
+        symbol, quantity, err = self._parse_smoketest_command(text)
+        if err is not None:
+            self._reply(chat_id, "Usage: /smoketest [BTCUSDT|ETHUSDT|BNBUSDT|DOTUSDT|SOLUSDT] [quantity]")
+            return
+
+        engine = getattr(self.runtime, "execution_engine", None)
+        if engine is None:
+            from .execution import ExecutionEngine
+            from .hyperliquid_live import HyperliquidLiveAdapter
+
+            engine = ExecutionEngine(
+                adapter=HyperliquidLiveAdapter(
+                    config=self.runtime.config.hyperliquid,
+                    dry_run=self.runtime.config.runtime.dry_run,
+                )
+            )
+
+        token = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+        now = utc_now()
+        try:
+            open_order = engine.place(
+                request_id=f"smoke-open-{token}",
+                symbol=symbol,
+                side=Side.LONG,
+                quantity=quantity,
+                price=None,
+                reduce_only=False,
+            )
+            close_order = engine.place(
+                request_id=f"smoke-close-{token}",
+                symbol=symbol,
+                side=Side.SHORT,
+                quantity=quantity,
+                price=None,
+                reduce_only=True,
+            )
+            open_status = open_order.status if open_order is not None else "SKIPPED"
+            close_status = close_order.status if close_order is not None else "SKIPPED"
+            mode = "dry_run" if self.runtime.config.runtime.dry_run else "live_testnet"
+            msg = (
+                "[SMOKETEST OK]\n"
+                f"exchange={self.runtime.config.exchange.kind} network={self.runtime.config.hyperliquid.network} mode={mode}\n"
+                f"symbol={symbol} qty={quantity:.6f}\n"
+                f"open_status={open_status} close_status={close_status}\n"
+                f"token={token}"
+            )
+            ok, reason = self._reply(chat_id, msg)
+            self.runtime.storage.insert_system_event(
+                now,
+                "telegram_smoketest_ok",
+                {
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "role": role,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "open_status": open_status,
+                    "close_status": close_status,
+                    "token": token,
+                    "sent": ok,
+                    "reason": reason,
+                },
+            )
+        except Exception as exc:
+            msg = (
+                "[SMOKETEST FAILED]\n"
+                f"symbol={symbol} qty={quantity:.6f}\n"
+                f"error={type(exc).__name__}: {exc}"
+            )
+            ok, reason = self._reply(chat_id, msg[:3800])
+            self.runtime.storage.insert_system_event(
+                now,
+                "telegram_smoketest_failed",
+                {
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "role": role,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                    "sent": ok,
+                    "reason": reason,
+                },
+            )
 
     def _request_danger_confirm(self, action: str, chat_id: str, user_id: str) -> None:
         code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
@@ -810,6 +916,38 @@ class TelegramCommandBot:
             return float(token)
         except ValueError:
             return None
+
+    def _parse_smoketest_command(self, text: str) -> tuple[str, float, str | None]:
+        tokens = [t for t in text.replace("，", " ").split(" ") if t]
+        watchlist = [s.upper().strip() for s in self.runtime.config.trading.symbols if str(s).strip()]
+        default_symbol = "BTCUSDT" if "BTCUSDT" in watchlist else (watchlist[0] if watchlist else "BTCUSDT")
+        symbol = default_symbol
+        default_qty = {
+            "BTCUSDT": 0.001,
+            "ETHUSDT": 0.01,
+            "BNBUSDT": 0.05,
+            "SOLUSDT": 0.2,
+            "DOTUSDT": 2.0,
+        }
+        quantity = default_qty.get(symbol, 1.0)
+        if len(tokens) >= 2:
+            candidate_symbol = self._normalize_symbol(tokens[1])
+            if candidate_symbol is not None:
+                symbol = candidate_symbol
+                quantity = default_qty.get(symbol, quantity)
+            else:
+                maybe_qty = self._parse_positive_amount(tokens[1])
+                if maybe_qty is None:
+                    return (symbol, quantity, "invalid_symbol_or_quantity")
+                quantity = maybe_qty
+        if len(tokens) >= 3:
+            maybe_qty = self._parse_positive_amount(tokens[2])
+            if maybe_qty is None:
+                return (symbol, quantity, "invalid_quantity")
+            quantity = maybe_qty
+        if symbol not in watchlist:
+            return (symbol, quantity, "symbol_not_in_watchlist")
+        return (symbol, quantity, None)
 
     def _latest_auto_settlement_text(self) -> str:
         getter = getattr(self.runtime.storage, "get_latest_trade_feedback", None)
