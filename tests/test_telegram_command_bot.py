@@ -62,6 +62,9 @@ def _bot(tmp_path: Path) -> TelegramCommandBot:
         _refresh_account_for_symbol=lambda symbol="": None,
         switch_hyperliquid_network=lambda network: (True, network),
         execution_engine=None,
+        _collect_auto_candidates=lambda analyses: [],
+        _select_auto_candidates=lambda candidates: [],
+        _execute_candidate=lambda candidate: True,
     )
     return TelegramCommandBot(runtime=runtime, notifier=runtime.notifier, offset_path=tmp_path / "offset.txt")
 
@@ -176,6 +179,7 @@ def test_menu_commands_and_alive_command(tmp_path: Path):
         "help",
         "result",
         "smoketest",
+        "scanexec",
         "pause",
         "resume",
         "riskoff",
@@ -278,3 +282,27 @@ def test_smoketest_blocked_on_mainnet(tmp_path: Path):
     bot._handle_text_command("/smoketest btc 0.001", chat_id="100", user_id="200", role="admin")
     payload = "\n".join(bot.notifier.sent_texts)
     assert "only allowed on testnet" in payload
+
+
+def test_scanexec_requires_admin(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot._handle_text_command("/scanexec btc", chat_id="100", user_id="200", role="viewer")
+    payload = "\n".join(bot.notifier.sent_texts)
+    assert "Permission denied" in payload
+
+
+def test_scanexec_executes_selected_candidates(tmp_path: Path):
+    bot = _bot(tmp_path)
+    bot.runtime.analyze_symbols = lambda symbols, push_to_telegram=False, timeframe_mode="auto", manual_total_usdt=None: [
+        SimpleNamespace(symbol="BTCUSDT", suitable=True, reasons=["advice_id:A-BTC-1H-TEST"], message="ok")
+    ]
+    bot.runtime._collect_auto_candidates = lambda analyses: [
+        SimpleNamespace(symbol="BTCUSDT", advice_id="A-BTC-1H-TEST", score=0.72)
+    ]
+    bot.runtime._select_auto_candidates = lambda candidates: candidates
+    bot.runtime._execute_candidate = lambda candidate: True
+
+    bot._handle_text_command("/scanexec btc 15m", chat_id="100", user_id="200", role="admin")
+    payload = "\n".join(bot.notifier.sent_texts)
+    assert "[SCANEXEC]" in payload
+    assert "executed=1" in payload

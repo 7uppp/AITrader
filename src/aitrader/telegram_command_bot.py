@@ -34,7 +34,7 @@ VIEWER_COMMANDS = {
     "/net",
 }
 TRADER_COMMANDS = VIEWER_COMMANDS | {"/result", "/win", "/loss"}
-ADMIN_COMMANDS = TRADER_COMMANDS | {"/smoketest", "/pause", "/resume", "/riskoff", "/closeall", "/killswitch", "/confirm"}
+ADMIN_COMMANDS = TRADER_COMMANDS | {"/smoketest", "/scanexec", "/pause", "/resume", "/riskoff", "/closeall", "/killswitch", "/confirm"}
 DANGEROUS_COMMANDS = {"/closeall", "/killswitch"}
 
 
@@ -163,6 +163,10 @@ class TelegramCommandBot:
             self._handle_smoketest_command(normalized, chat_id=chat_id, user_id=user_id, role=role)
             return
 
+        if lower.startswith("/scanexec"):
+            self._handle_scanexec_command(normalized, chat_id=chat_id, user_id=user_id, role=role)
+            return
+
         if lower.startswith("/scan") or self._looks_like_compact_scan(lower):
             symbols, timeframe, manual_total_usdt, errors = self._parse_symbols_and_timeframe(normalized)
             if errors:
@@ -259,7 +263,8 @@ class TelegramCommandBot:
                 "alive check: /alive\n"
                 "result report: /result <short_id|full_id|last> win 1.2\n"
                 "quick report: /win BTCUSDT 0.8 or /loss ETHUSDT -0.6\n"
-                "smoke test: /smoketest BTCUSDT 0.001 (admin, testnet only)"
+                "smoke test: /smoketest BTCUSDT 0.001 (admin, testnet only)\n"
+                "scan&execute: /scanexec [BTCUSDT] [15m|1h|auto] (admin)"
             )
             ok, reason = self._reply(chat_id, msg)
             self.runtime.storage.insert_system_event(
@@ -291,6 +296,7 @@ class TelegramCommandBot:
                 "/win SOLUSDT 0.8 -> quick win report\n"
                 "/loss ETHUSDT -0.6 -> quick loss report\n"
                 "/smoketest BTCUSDT 0.001 -> open then close test order (admin, testnet only)\n"
+                "/scanexec BTCUSDT 15m -> scan once and execute selected candidates (admin)\n"
                 "/pause /resume /riskoff -> admin mode controls\n"
                 "/closeall /killswitch -> admin only with /confirm CODE"
             )
@@ -334,6 +340,7 @@ class TelegramCommandBot:
             {"command": "help", "description": "Show command help"},
             {"command": "result", "description": "Report advice result by ID"},
             {"command": "smoketest", "description": "Open+close smoke test (admin)"},
+            {"command": "scanexec", "description": "Scan and execute once (admin)"},
             {"command": "pause", "description": "Pause new entries (admin)"},
             {"command": "resume", "description": "Resume running (admin)"},
             {"command": "riskoff", "description": "Risk-off mode (admin)"},
@@ -641,6 +648,111 @@ class TelegramCommandBot:
                     "reason": reason,
                 },
             )
+
+    def _handle_scanexec_command(self, text: str, chat_id: str, user_id: str, role: str) -> None:
+        if role != "admin":
+            self._reply(chat_id, "Permission denied for /scanexec. Admin only.")
+            return
+
+        runtime_cfg = self.runtime.config.runtime
+        if (not runtime_cfg.auto_trade_enabled) or runtime_cfg.advisory_only:
+            self._reply(chat_id, "scanexec blocked: auto trade is disabled. Require auto_trade_enabled=true and advisory_only=false.")
+            return
+
+        symbols, timeframe, manual_total_usdt, errors = self._parse_symbols_and_timeframe(text)
+        if errors:
+            self._reply(chat_id, "Usage: /scanexec [BTCUSDT|ETHUSDT|DOTUSDT|SOLUSDT] [15m|1h|auto] [budget]")
+            return
+
+        analyses = self.runtime.analyze_symbols(
+            symbols,
+            push_to_telegram=False,
+            timeframe_mode=timeframe,
+            manual_total_usdt=manual_total_usdt,
+        )
+        candidates_getter = getattr(self.runtime, "_collect_auto_candidates", None)
+        selector = getattr(self.runtime, "_select_auto_candidates", None)
+        executor = getattr(self.runtime, "_execute_candidate", None)
+        if not callable(candidates_getter) or not callable(selector) or not callable(executor):
+            self._reply(chat_id, "scanexec unavailable: runtime auto-trade hooks missing.")
+            return
+
+        candidates = candidates_getter(analyses)
+        selected = selector(candidates)
+        now = utc_now()
+
+        if not selected:
+            suitable = sum(1 for a in analyses if a.suitable)
+            rejected = len(analyses) - suitable
+            msg = (
+                "[SCANEXEC]\n"
+                f"symbols={','.join(symbols)} tf={timeframe}\n"
+                f"suitable={suitable} rejected={rejected}\n"
+                f"candidates={len(candidates)} selected=0\n"
+                "result=no executable candidate this round"
+            )
+            ok, reason = self._reply(chat_id, msg)
+            self.runtime.storage.insert_system_event(
+                now,
+                "telegram_scanexec_no_candidate",
+                {
+                    "symbols": symbols,
+                    "timeframe": timeframe,
+                    "manual_total_usdt": manual_total_usdt,
+                    "suitable": suitable,
+                    "rejected": rejected,
+                    "candidate_count": len(candidates),
+                    "selected_count": 0,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "role": role,
+                    "sent": ok,
+                    "reason": reason,
+                },
+            )
+            return
+
+        executed = 0
+        failed = 0
+        lines: list[str] = []
+        for candidate in selected:
+            outcome = bool(executor(candidate))
+            symbol = getattr(candidate, "symbol", "?")
+            advice_id = str(getattr(candidate, "advice_id", "-"))
+            score = float(getattr(candidate, "score", 0.0))
+            if outcome:
+                executed += 1
+                lines.append(f"{symbol} {advice_id} score={score:.3f} -> EXECUTED")
+            else:
+                failed += 1
+                lines.append(f"{symbol} {advice_id} score={score:.3f} -> FAILED")
+
+        msg = (
+            "[SCANEXEC]\n"
+            f"symbols={','.join(symbols)} tf={timeframe}\n"
+            f"candidates={len(candidates)} selected={len(selected)} executed={executed} failed={failed}\n"
+            + "\n".join(lines[:8])
+        )
+        ok, reason = self._reply(chat_id, msg[:3800])
+        self.runtime.storage.insert_system_event(
+            now,
+            "telegram_scanexec_command",
+            {
+                "symbols": symbols,
+                "timeframe": timeframe,
+                "manual_total_usdt": manual_total_usdt,
+                "candidate_count": len(candidates),
+                "selected_count": len(selected),
+                "executed": executed,
+                "failed": failed,
+                "lines": lines,
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "role": role,
+                "sent": ok,
+                "reason": reason,
+            },
+        )
 
     def _request_danger_confirm(self, action: str, chat_id: str, user_id: str) -> None:
         code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
